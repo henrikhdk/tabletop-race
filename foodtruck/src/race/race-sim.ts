@@ -117,6 +117,8 @@ export class RaceSim {
   playerTop = 1;
   playerGrip = 1;
   playerAccel = 1;
+  /** assisted driving runs a touch under the limit: cooking (abilities) is what wins races */
+  assistPace = 0.92;
   crashes = 0;
   onCrash?: (car: CarState) => void;
   private rand: () => number;
@@ -224,7 +226,7 @@ export class RaceSim {
     const v = car.speed;
     for (let j = 0; j < 80; j++) {
       const k = this.track.curvature[this.sampleIndex(car.dist + j * ds)];
-      const lim = ((this.vmax * car.driver.skill * grip * this.playerGrip) / (1 + this.cornerK * k)) * 1.17;
+      const lim = ((this.vmax * car.driver.skill * grip * this.playerGrip) / (1 + this.cornerK * k)) * 1.17 * this.assistPace;
       if (v > lim && (v * v - lim * lim) / (2 * 0.95) >= j * ds - 0.004) return false;
     }
     return true;
@@ -281,7 +283,7 @@ export class RaceSim {
         }
         const limit = (this.vmax * car.driver.skill * grip * this.playerGrip) / (1 + this.cornerK * k);
         if (this.autoDrive) this.throttle = this.botThrottle(car, grip) ? 1 : 0;
-        target = this.throttle > 0.5 ? this.vmax * 1.04 * grip * this.playerTop : 0;
+        target = this.throttle > 0.5 ? this.vmax * 1.04 * grip * this.playerTop * (this.autoDrive ? this.assistPace : 1) : 0;
         if (car.speed > limit * 1.25) car.overT += dt;
         else car.overT = Math.max(0, car.overT - dt * 2);
         if (car.overT > 0.1) {

@@ -35,6 +35,7 @@ import { CarState, CRASH_TIME, formatTime, RacePhase, RaceSim, TEAMS, tyreLife }
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
 import { RaceAudio } from './race-audio.js';
 import { HandPlay } from './hand-play.js';
+import { PalmUpDetector } from './palm-menu.js';
 import { Build, buildStats, SLOT_NAMES, SLOTS, TruckModel } from './food-truck.js';
 
 const PLAYER = 6; // grid slot P7: you start mid-pack
@@ -46,6 +47,28 @@ const G_ROW_H = 106;
 const G_OPT_X = [236, 580, 924];
 const G_OPT_W = 322;
 const G_RACE = { x: 760, y: 470, w: 478, h: 150 };
+/** the build used by READY TRUCK (and to fill any empty slot) */
+const READY_BUILD: Build = [0, 0, 2];
+// results (podium) and pause-menu panel layouts (canvas px)
+const R_W = 1262;
+const R_H = 660;
+const R_BTNS = [
+  { id: 'results:again', label: 'RACE AGAIN', x: 70 },
+  { id: 'results:garage', label: 'GARAGE', x: 660 },
+] as const;
+const R_BTN = { y: 510, w: 532, h: 120 };
+const M_W = 900;
+const M_H = 760;
+const M_BTNS = [
+  { id: 'menu:resume', label: 'RESUME', y: 150 },
+  { id: 'menu:restart', label: 'RESTART RACE', y: 352 },
+  { id: 'menu:garage', label: 'GARAGE', y: 554 },
+] as const;
+const M_BTN = { x: 60, w: 780, h: 170 };
+/** after you cross the line, the rest of the field gets this long to finish */
+const FINISH_GRACE = 4;
+/** podium returns to the garage by itself after this long */
+const RESULTS_AUTO_RETURN = 25;
 import { easeInOut, easeOutBack, easeOutCubic, introState, win } from './intro-state.js';
 import { loadProfile, Profile, saveProfile, scorePrediction } from './profile.js';
 
@@ -144,6 +167,17 @@ export class RaceSystem extends createSystem({
   private partDrop = [9, 9, 9];
   private deliverT = 0;
   private garageShown = 0;
+  // --- results + palm-up pause menu ---
+  private results!: CanvasPanel;
+  private resultsT = -1;
+  private dbgT = 0;
+  private finishGrace = -1;
+  private menu!: CanvasPanel;
+  private menuOpen = false;
+  private menuPrevScale = 1;
+  private palmUp!: PalmUpDetector;
+  private headPos = new Vector3();
+  private headFwd = new Vector3();
 
   private leaderboard!: CanvasPanel;
   private controls!: CanvasPanel;
@@ -198,6 +232,10 @@ export class RaceSystem extends createSystem({
         this.keyGas = true;
         e.preventDefault();
       }
+      if (e.code === 'KeyM' && !e.repeat) {
+        if (this.menuOpen) this.closeMenu();
+        else this.openMenu();
+      }
     };
     const up = (e: KeyboardEvent) => {
       if (e.code === 'Space') this.keyGas = false;
@@ -219,11 +257,15 @@ export class RaceSystem extends createSystem({
         this.hoveredAction = e.getValue(UiButton, 'action') ?? '';
         this.drawControls();
         this.drawGarage();
+        this.drawMenu();
+        this.drawResults();
       }),
       this.queries.buttonHovered.subscribe('disqualify', () => {
         this.hoveredAction = '';
         this.drawControls();
         this.drawGarage();
+        this.drawMenu();
+        this.drawResults();
       }),
     );
   }
@@ -360,6 +402,8 @@ export class RaceSystem extends createSystem({
     }
 
     this.setupGarage(boardEntity, btnMat);
+    this.setupResults(boardEntity, btnMat);
+    this.setupMenu(btnMat);
 
     // ---- strategy panel: manage your driver (left of the controls) ------
     this.strategy = new CanvasPanel(640, 240, 0.27, 'strategy');
@@ -407,7 +451,8 @@ export class RaceSystem extends createSystem({
     const q = new URLSearchParams(location.search);
     this.claimPlayer();
     if (q.has('debug')) (window as unknown as { __ft: unknown }).__ft = this;
-    this.sim.autoDrive = q.has('autodrive');
+    // assisted driving: the truck follows the track on its own (?drive = legacy pinch-to-gas)
+    this.sim.autoDrive = !q.has('drive');
     this.sim.onCrash = (car) => {
       const r = this.carRoots[car.index];
       this.hand?.burst(r.position.x, r.position.y, r.position.z, 1, true);
@@ -441,8 +486,19 @@ export class RaceSystem extends createSystem({
   private onButton(action: string) {
     if (!this.sim) return;
     this.audio.unlock();
-    // driving: a pinch aimed at the panel is the throttle, not a button press
-    if (this.sim.humanDrives && (this.sim.phase === RacePhase.Racing || this.sim.phase === RacePhase.Lights)) return;
+    if (action.startsWith('menu:')) {
+      this.onMenu(action);
+      return;
+    }
+    if (action.startsWith('results:')) {
+      if (this.resultsT < 0) return;
+      this.audio.click();
+      if (action === 'results:again') this.restartRace();
+      else this.backToGarage();
+      return;
+    }
+    // legacy pinch-to-gas driving: a pinch aimed at the panel is the throttle, not a button press
+    if (this.sim.humanDrives && !this.sim.autoDrive && (this.sim.phase === RacePhase.Racing || this.sim.phase === RacePhase.Lights)) return;
     if (action.startsWith('part:')) {
       if (this.mode !== 'garage') return;
       const [, sl, op] = action.split(':');
@@ -450,7 +506,10 @@ export class RaceSystem extends createSystem({
       return;
     }
     if (action === 'race') {
-      if (this.mode === 'garage' && this.build.every((b) => b >= 0)) this.startDeliver();
+      if (this.mode !== 'garage') return;
+      // incomplete build = READY TRUCK: any empty slot takes the ready-made part
+      for (let sl = 0; sl < 3; sl++) if (this.build[sl] < 0) this.pickPart(sl, READY_BUILD[sl]);
+      this.startDeliver();
       return;
     }
     this.audio.click();
@@ -462,11 +521,7 @@ export class RaceSystem extends createSystem({
         else if (this.sim.phase === RacePhase.Racing) this.timeScale = 0;
         break;
       case 'restart':
-        this.sim.reset();
-        this.claimPlayer();
-        this.lastScore = null;
-        this.timeScale = 1;
-        this.enterGarage();
+        this.backToGarage();
         break;
       case 'speed':
         this.timeScale = this.timeScale >= 4 ? 1 : this.timeScale * 2;
@@ -527,8 +582,24 @@ export class RaceSystem extends createSystem({
     const steps = Math.max(1, Math.ceil(this.timeScale));
     for (let i = 0; i < steps; i++) this.sim.step((dt * this.timeScale) / steps);
 
+    this.updateFinish(delta);
     if (prevPhase !== RacePhase.Finished && this.sim.phase === RacePhase.Finished) this.onRaceFinished();
     if (prevPhase !== this.sim.phase) this.drawControls();
+    this.updateResults(delta);
+    if (import.meta.env.DEV) {
+      this.dbgT += delta;
+      if (this.dbgT > 5) {
+        this.dbgT = 0;
+        const me = this.sim.cars[PLAYER];
+        console.info(`[flow] mode=${this.mode} phase=${this.sim.phase} lap=${me.lap}/${this.sim.totalLaps} pos=${me.position} t=${this.sim.time.toFixed(1)} fps=${(1 / Math.max(delta, 1e-3)).toFixed(0)} results=${this.resultsT.toFixed(1)} menu=${this.menuOpen}`);
+      }
+    }
+    {
+      const e = this.player.head.matrixWorld.elements;
+      this.headPos.set(e[12], e[13], e[14]);
+      this.headFwd.set(-e[8], -e[9], -e[10]);
+      if (this.palmUp.update(delta, this.headPos, this.headFwd) && !this.menuOpen) this.openMenu();
+    }
 
     if (this.introActive) this.introT += delta;
     this.updateGarage(delta);
@@ -739,6 +810,226 @@ export class RaceSystem extends createSystem({
     }
   }
 
+  // ---------------------------------------------------------------------
+  // full loop: garage -> grid -> race -> podium -> garage, plus palm-up pause menu
+
+  /** podium / results card, shown where the garage panel sits */
+  private setupResults(boardEntity: Entity, btnMat: MeshBasicMaterial) {
+    const panel = new CanvasPanel(R_W, R_H, 0.5, 'results-panel');
+    panel.mesh.position.set(0, 0.085, 0.42);
+    panel.mesh.rotation.x = -0.8;
+    panel.mesh.scale.setScalar(0.0001);
+    const pe = this.world.createTransformEntity(panel.mesh, boardEntity);
+    for (const b of R_BTNS) {
+      const r = panel.rectToLocal(b.x, R_BTN.y, R_BTN.w, R_BTN.h);
+      const hit = new Mesh(new BoxGeometry(r.w, r.h, 0.01), btnMat);
+      hit.name = `btn-${b.id}`;
+      hit.position.set(r.cx, r.cy, 0.004);
+      const e = this.world.createTransformEntity(hit, pe);
+      e.addComponent(UiButton, { action: b.id });
+      e.addComponent(RayInteractable);
+    }
+    this.results = panel;
+  }
+
+  /** pause menu: opened by turning a palm up, floats in front of the player */
+  private setupMenu(btnMat: MeshBasicMaterial) {
+    this.palmUp = new PalmUpDetector(this.world);
+    const panel = new CanvasPanel(M_W, M_H, 0.3, 'pause-menu');
+    panel.mesh.renderOrder = 30;
+    panel.mesh.scale.setScalar(0.0001);
+    const pe = this.world.createTransformEntity(panel.mesh);
+    for (const b of M_BTNS) {
+      const r = panel.rectToLocal(M_BTN.x, b.y, M_BTN.w, M_BTN.h);
+      const hit = new Mesh(new BoxGeometry(r.w, r.h, 0.01), btnMat);
+      hit.name = `btn-${b.id}`;
+      hit.position.set(r.cx, r.cy, 0.004);
+      const e = this.world.createTransformEntity(hit, pe);
+      e.addComponent(UiButton, { action: b.id });
+      e.addComponent(RayInteractable);
+    }
+    this.menu = panel;
+  }
+
+  private openMenu() {
+    if (this.menuOpen || !this.menu) return;
+    this.audio.unlock();
+    this.menuOpen = true;
+    this.menuPrevScale = this.timeScale > 0 ? this.timeScale : 1;
+    this.timeScale = 0;
+    // float 45 cm in front of the eyes, a little below, facing the player
+    const head = this.player.head;
+    head.updateWorldMatrix(true, false);
+    const e = head.matrixWorld.elements;
+    this.headPos.set(e[12], e[13], e[14]);
+    this.headFwd.set(-e[8], 0, -e[10]);
+    if (this.headFwd.lengthSq() < 1e-6) this.headFwd.set(0, 0, -1);
+    this.headFwd.normalize();
+    const m = this.menu.mesh;
+    m.position.copy(this.headPos).addScaledVector(this.headFwd, 0.45);
+    m.position.y -= 0.12;
+    m.lookAt(this.headPos);
+    m.scale.setScalar(1);
+    this.audio.beep(660, 0.1, 0.12);
+    this.drawMenu();
+    this.drawControls();
+  }
+
+  private closeMenu() {
+    if (!this.menuOpen) return;
+    this.menuOpen = false;
+    this.menu.mesh.scale.setScalar(0.0001);
+    this.timeScale = this.menuPrevScale;
+    this.palmUp.suppress(1);
+    this.drawControls();
+  }
+
+  private onMenu(action: string) {
+    if (!this.menuOpen) return;
+    this.audio.click();
+    this.closeMenu();
+    if (action === 'menu:restart') this.restartRace();
+    else if (action === 'menu:garage') this.backToGarage();
+  }
+
+  private resetRaceState() {
+    this.sim.reset();
+    this.claimPlayer();
+    this.lastScore = null;
+    this.timeScale = 1;
+    this.resultsT = -1;
+    this.finishGrace = -1;
+    this.results.mesh.scale.setScalar(0.0001);
+  }
+
+  /** same truck, straight back onto the grid */
+  private restartRace() {
+    this.resetRaceState();
+    if (this.build.every((b) => b >= 0)) this.startDeliver();
+    else this.enterGarage();
+    this.drawAll();
+  }
+
+  private backToGarage() {
+    this.resetRaceState();
+    this.enterGarage();
+    this.drawAll();
+  }
+
+  /** once you cross the line, the others get a few seconds, then the flag falls for everyone */
+  private updateFinish(delta: number) {
+    if (this.mode !== 'race' || this.sim.phase !== RacePhase.Racing || this.prediction < 0) return;
+    const me = this.sim.cars[this.prediction];
+    if (!me.finished) return;
+    if (this.finishGrace < 0) {
+      this.finishGrace = 0;
+      this.audio.honk(me.position === 1 ? 5 : 2);
+    }
+    this.finishGrace += delta * Math.max(this.timeScale, 0);
+    if (this.finishGrace >= FINISH_GRACE) this.sim.phase = RacePhase.Finished;
+  }
+
+  private updateResults(delta: number) {
+    if (this.mode !== 'race' || this.sim.phase !== RacePhase.Finished) return;
+    if (this.resultsT < 0) {
+      this.resultsT = 0;
+      this.controls.mesh.scale.setScalar(0.0001);
+      this.drawResults();
+    }
+    if (this.menuOpen) return;
+    this.resultsT += delta;
+    this.results.mesh.scale.setScalar(Math.max(0.0001, easeOutBack(Math.min(1, this.resultsT / 0.5))));
+    if (this.resultsT > RESULTS_AUTO_RETURN) this.backToGarage();
+  }
+
+  private drawResults() {
+    const p = this.results;
+    if (!p || this.resultsT < 0) return;
+    const ctx = p.ctx;
+    p.background(0.9);
+    // picnic-tablecloth chequered band across the top
+    const sq = 30;
+    for (let x = 8; x < R_W - 8; x += sq)
+      for (let r = 0; r < 2; r++) {
+        ctx.fillStyle = ((x / sq) | 0) % 2 === r ? '#e8343f' : '#fff6ea';
+        ctx.fillRect(x, 8 + r * sq, Math.min(sq, R_W - 8 - x), sq);
+      }
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd23a';
+    ctx.font = '900 54px system-ui, sans-serif';
+    ctx.fillText('FINAL RESULTS', R_W / 2, 112);
+    // podium: P2 left, P1 centre (tallest), P3 right
+    const order = this.sim.order;
+    const slots: [number, number, number][] = [
+      [1, 230, 120],
+      [0, 631, 170],
+      [2, 1032, 90],
+    ];
+    for (const [pos, cx, h] of slots) {
+      const car = order[pos];
+      if (!car) continue;
+      const team = TEAMS[car.driver.team];
+      const mine = car.index === this.prediction;
+      const top = 420 - h;
+      roundRect(ctx, cx - 170, top, 340, h, 18);
+      ctx.fillStyle = mine ? 'rgba(255,210,58,0.55)' : 'rgba(255,255,255,0.12)';
+      ctx.fill();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = team.color;
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 46px system-ui, sans-serif';
+      ctx.fillText(`P${pos + 1}`, cx, top + 38);
+      ctx.font = '800 32px system-ui, sans-serif';
+      ctx.fillText(mine ? 'YOU' : car.driver.name, cx, top - 52);
+      ctx.fillStyle = team.color;
+      ctx.font = '700 24px system-ui, sans-serif';
+      ctx.fillText(team.name, cx, top - 20);
+    }
+    ctx.fillStyle = '#cfe9ff';
+    ctx.font = '700 32px system-ui, sans-serif';
+    ctx.fillText(this.lastScore ? this.lastScore.text : 'Race over', R_W / 2, 462);
+    for (const b of R_BTNS) {
+      const hover = this.hoveredAction === b.id;
+      roundRect(ctx, b.x, R_BTN.y, R_BTN.w, R_BTN.h, 28);
+      ctx.fillStyle = hover ? 'rgba(61,255,139,0.75)' : b.id === 'results:again' ? 'rgba(46,217,168,0.45)' : 'rgba(255,178,26,0.4)';
+      ctx.fill();
+      ctx.lineWidth = hover ? 6 : 3;
+      ctx.strokeStyle = b.id === 'results:again' ? '#3dff8b' : '#ffd23a';
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 48px system-ui, sans-serif';
+      ctx.fillText(b.label, b.x + R_BTN.w / 2, R_BTN.y + R_BTN.h / 2 + 2);
+    }
+    p.commit();
+  }
+
+  private drawMenu() {
+    const p = this.menu;
+    if (!p || !this.menuOpen) return;
+    const ctx = p.ctx;
+    p.background(0.94);
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd23a';
+    ctx.font = '900 64px system-ui, sans-serif';
+    ctx.fillText('PAUSED', M_W / 2, 76);
+    for (const b of M_BTNS) {
+      const hover = this.hoveredAction === b.id;
+      roundRect(ctx, M_BTN.x, b.y, M_BTN.w, M_BTN.h, 36);
+      ctx.fillStyle = hover ? 'rgba(56,245,255,0.55)' : b.id === 'menu:resume' ? 'rgba(46,217,168,0.45)' : 'rgba(255,255,255,0.12)';
+      ctx.fill();
+      ctx.lineWidth = hover ? 7 : 3;
+      ctx.strokeStyle = hover ? '#38f5ff' : 'rgba(255,255,255,0.45)';
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 62px system-ui, sans-serif';
+      ctx.fillText(b.label, M_W / 2, b.y + M_BTN.h / 2 + 3);
+    }
+    p.commit();
+  }
+
   private drawGarage() {
     const G = this.garage;
     if (!G) return;
@@ -801,18 +1092,30 @@ export class RaceSystem extends createSystem({
       ctx.fillStyle = ['#ff7a1a', '#3dff8b', '#2ee6ff'][i];
       ctx.fill();
     });
+    // one big button: LET'S RACE with a full build, READY TRUCK (auto-fills) otherwise
     const ready = this.build.every((b) => b >= 0);
     const hover = this.hoveredAction === 'race';
     roundRect(ctx, G_RACE.x, G_RACE.y, G_RACE.w, G_RACE.h, 30);
-    ctx.fillStyle = ready ? (hover ? 'rgba(61,255,139,0.75)' : 'rgba(46,217,168,0.5)') : 'rgba(255,255,255,0.06)';
+    ctx.fillStyle = ready
+      ? hover ? 'rgba(61,255,139,0.75)' : 'rgba(46,217,168,0.5)'
+      : hover ? 'rgba(255,178,26,0.7)' : 'rgba(255,178,26,0.32)';
     ctx.fill();
-    ctx.lineWidth = hover && ready ? 6 : 2;
-    ctx.strokeStyle = ready ? '#3dff8b' : 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = hover ? 6 : 3;
+    ctx.strokeStyle = ready ? '#3dff8b' : '#ffd23a';
     ctx.stroke();
     ctx.textAlign = 'center';
-    ctx.fillStyle = ready ? '#ffffff' : 'rgba(255,255,255,0.35)';
-    ctx.font = '900 52px system-ui, sans-serif';
-    ctx.fillText(ready ? "LET'S RACE!" : `${this.build.filter((b) => b < 0).length} PARTS LEFT`, G_RACE.x + G_RACE.w / 2, G_RACE.y + G_RACE.h / 2 + 2);
+    ctx.fillStyle = '#ffffff';
+    if (ready) {
+      ctx.font = '900 52px system-ui, sans-serif';
+      ctx.fillText("LET'S RACE!", G_RACE.x + G_RACE.w / 2, G_RACE.y + G_RACE.h / 2 + 2);
+    } else {
+      const left = this.build.filter((b) => b < 0).length;
+      ctx.font = '900 46px system-ui, sans-serif';
+      ctx.fillText('READY TRUCK', G_RACE.x + G_RACE.w / 2, G_RACE.y + 58);
+      ctx.font = '600 24px system-ui, sans-serif';
+      ctx.fillStyle = '#fff2cc';
+      ctx.fillText(`skip build · or bolt on ${left} more part${left > 1 ? 's' : ''}`, G_RACE.x + G_RACE.w / 2, G_RACE.y + 108);
+    }
     p.commit();
   }
 
@@ -1203,7 +1506,6 @@ export class RaceSystem extends createSystem({
     if (this.sim.humanDrives && this.prediction >= 0) {
       const me = this.sim.cars[this.prediction];
       const pts = scorePrediction(me.position, false).points;
-      this.audio.honk(me.position === 1 ? 5 : 2);
       const crash = this.sim.crashes === 0 ? 'clean race!' : `${this.sim.crashes} crash${this.sim.crashes > 1 ? 'es' : ''}`;
       this.lastScore = { points: pts, text: me.position === 1 ? `YOU WON! ${crash}` : `You finished P${me.position}, ${crash}` };
       this.profile.points += pts;
@@ -1305,7 +1607,14 @@ export class RaceSystem extends createSystem({
     if (this.sim.phase === RacePhase.Grid)
       hint = this.mode === 'race' ? 'Pinch START when ready' : 'Build your truck first!';
     else if (this.sim.phase === RacePhase.Lights)
-      hint = this.sim.humanDrives ? 'Get ready... PINCH & HOLD = GAS' : 'Lights...';
+      hint = this.sim.humanDrives && !this.sim.autoDrive ? 'Get ready... PINCH & HOLD = GAS' : 'Lights...';
+    else if (this.sim.phase === RacePhase.Racing && this.timeScale === 0) hint = 'Paused';
+    else if (this.sim.phase === RacePhase.Racing && this.sim.autoDrive && this.prediction >= 0) {
+      const me = this.sim.cars[this.prediction];
+      hint = me.finished
+        ? `Finished P${me.position}!`
+        : `P${me.position}  ·  LAP ${Math.min(this.sim.totalLaps, me.lap + 1)}/${this.sim.totalLaps}  ·  palm up = menu`;
+    }
     else if (this.sim.phase === RacePhase.Racing && this.sim.humanDrives && this.prediction >= 0) {
       const me = this.sim.cars[this.prediction];
       hint =
