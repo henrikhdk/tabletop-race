@@ -10,6 +10,7 @@ import {
   Group,
   Hovered,
   Mesh,
+  Object3D,
   MeshBasicMaterial,
   MeshStandardMaterial,
   PerspectiveCamera,
@@ -32,6 +33,7 @@ import { CarMarker, RaceBoard, UiButton } from './race-components.js';
 import { CarState, formatTime, RacePhase, RaceSim, TEAMS } from './race-sim.js';
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
 import { RaceAudio } from './race-audio.js';
+import { easeInOut, easeOutBack, easeOutCubic, introState, win } from './intro-state.js';
 import { loadProfile, Profile, saveProfile, scorePrediction } from './profile.js';
 
 const BUTTONS = [
@@ -121,6 +123,23 @@ export class RaceSystem extends createSystem({
 
   private uiTimer = 0;
   private frame = 0;
+  // --- opening sequence ---
+  private gantry?: Group;
+  private introActive = false;
+  private introT = 0;
+  private introLanded = 0;
+  private introCued = { swell: false, chime: false };
+  private autostartPending = 0;
+  private intro!: {
+    water?: Object3D;
+    land: Object3D[];
+    trees?: Object3D;
+    dome?: Mesh;
+    glow?: Mesh;
+    glowCount: number;
+    ring: Mesh;
+    title: CanvasPanel;
+  };
   private fpsPanel?: CanvasPanel;
   private fpsFrames = 0;
   private fpsTime = 0;
@@ -253,6 +272,7 @@ export class RaceSystem extends createSystem({
       gantry.add(post);
     }
     this.world.createTransformEntity(gantry, boardEntity);
+    this.gantry = gantry;
 
     // ---- leaderboard (right of the board, angled to the viewer) -------
     this.leaderboard = new CanvasPanel(512, 860, 0.25, 'leaderboard');
@@ -304,11 +324,9 @@ export class RaceSystem extends createSystem({
     }
     // ?autostart&speed=4 : start immediately (handy for demo capture on desktop)
     const q = new URLSearchParams(location.search);
-    if (q.has('autostart')) {
-      this.sim.startLights();
-      this.sim.lightsTime = 5;
-      this.timeScale = Math.max(1, Math.min(8, Number(q.get('speed')) || 1));
-    }
+    if (q.has('autostart')) this.autostartPending = Math.max(1, Math.min(8, Number(q.get('speed')) || 1));
+    this.setupIntro(boardEntity);
+    this.startIntro();
     this.placeCars();
     this.drawControls();
     this.drawLeaderboard();
@@ -352,7 +370,10 @@ export class RaceSystem extends createSystem({
         this.onboardOn = !this.onboardOn;
         break;
       case 'place':
-        if (this.placement === 'table' || !this.placeOnTable()) this.placeInFront();
+        if (this.world.visibilityState.peek() !== VisibilityState.NonImmersive) {
+          if (this.placement === 'table' || !this.placeOnTable()) this.placeInFront();
+        }
+        this.startIntro();
         break;
     }
     this.drawAll();
@@ -376,10 +397,13 @@ export class RaceSystem extends createSystem({
     } else if (!this.autoPlaced) {
       // give plane detection a moment, then snap to the real table (or float in front)
       this.xrTime += delta;
-      if (this.xrTime > 1.2 && this.placeOnTable()) this.autoPlaced = true;
-      else if (this.xrTime > 4) {
+      if (this.xrTime > 1.2 && this.placeOnTable()) {
+        this.autoPlaced = true;
+        this.startIntro();
+      } else if (this.xrTime > 4) {
         this.placeInFront();
         this.autoPlaced = true;
+        this.startIntro();
       }
     }
     if (this.world.visibilityState.peek() === VisibilityState.VisibleBlurred) return;
@@ -392,6 +416,7 @@ export class RaceSystem extends createSystem({
     if (prevPhase !== RacePhase.Finished && this.sim.phase === RacePhase.Finished) this.onRaceFinished();
     if (prevPhase !== this.sim.phase) this.drawControls();
 
+    if (this.introActive) this.introT += delta;
     this.placeCars();
     const lit = this.sim.lightsOn;
     for (let i = 0; i < 5; i++) this.lights[i].material = i < lit ? this.lightOn : this.lightOff;
@@ -437,12 +462,151 @@ export class RaceSystem extends createSystem({
       this.carRings[car.index].visible = car.index === this.followed;
     }
     this.updateTrails();
+    if (this.introActive) this.applyIntro();
     if (this.prediction >= 0) {
       const r = this.carRoots[this.prediction];
       this.pickMarker.visible = true;
       this.pickMarker.position.set(r.position.x, r.position.y + 0.03 + Math.sin(performance.now() / 250) * 0.003, r.position.z);
     } else {
       this.pickMarker.visible = false;
+    }
+  }
+
+  private setupIntro(boardEntity: Entity) {
+    const obj = boardEntity.object3D!;
+    const glow = obj.getObjectByName('board-glow') as Mesh | undefined;
+    const ringGeo = new RingGeometry(0.48, 0.5, 64);
+    ringGeo.rotateX(-Math.PI / 2);
+    const ring = new Mesh(
+      ringGeo,
+      new MeshBasicMaterial({ color: '#38f5ff', transparent: true, opacity: 0, blending: AdditiveBlending, depthWrite: false }),
+    );
+    ring.name = 'intro-ring';
+    ring.position.y = 0.014;
+    ring.visible = false;
+    this.world.createTransformEntity(ring, boardEntity);
+    const title = new CanvasPanel(1024, 300, 0.62, 'intro-title');
+    title.mesh.position.set(0, 0.12, 0.12);
+    (title.mesh.material as MeshBasicMaterial).opacity = 0;
+    title.mesh.visible = false;
+    this.world.createTransformEntity(title.mesh, boardEntity);
+    {
+      const ctx = title.ctx;
+      ctx.clearRect(0, 0, 1024, 300);
+      const g = ctx.createLinearGradient(0, 0, 1024, 0);
+      g.addColorStop(0, 'rgba(10,16,28,0)');
+      g.addColorStop(0.2, 'rgba(10,16,28,0.75)');
+      g.addColorStop(0.8, 'rgba(10,16,28,0.75)');
+      g.addColorStop(1, 'rgba(10,16,28,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 40, 1024, 220);
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = '#38f5ff';
+      ctx.font = '700 34px system-ui, sans-serif';
+      ctx.fillText('LUMEN GRAND CIRCUIT  ·  ROUND 1', 512, 88);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '900 96px system-ui, sans-serif';
+      ctx.fillText('ÎLE LUMIÈRE', 512, 160);
+      ctx.fillStyle = '#ffe14d';
+      ctx.font = '600 32px system-ui, sans-serif';
+      ctx.fillText('Pinch a car to call the winner', 512, 228);
+      title.commit();
+    }
+    this.intro = {
+      water: obj.getObjectByName('water'),
+      land: ['board-solid', 'island-fill'].map((n) => obj.getObjectByName(n)).filter((o): o is Object3D => !!o),
+      trees: obj.getObjectByName('trees'),
+      dome: obj.getObjectByName('dome') as Mesh | undefined,
+      glow,
+      glowCount: glow ? glow.geometry.getAttribute('position').count : 0,
+      ring,
+      title,
+    };
+  }
+
+  private startIntro() {
+    if (!this.intro) return;
+    this.introActive = true;
+    this.introT = -0.4;
+    this.introLanded = 0;
+    this.introCued.swell = false;
+    this.introCued.chime = false;
+    this.audio.unlock();
+    this.applyIntro();
+  }
+
+  /** The opening: water spreads, island rises, light runs the lap, life arrives, cars land, title. */
+  private applyIntro() {
+    const t = this.introT;
+    const I = this.intro;
+    const done = t > 7.8;
+    const T = done ? 99 : t;
+    if (!this.introCued.swell && T >= 0) {
+      this.introCued.swell = true;
+      this.audio.swell(2.8);
+    }
+    const sw = easeOutCubic(win(T, 0, 1.4));
+    I.water?.scale.set(Math.max(0.001, sw), 1, Math.max(0.001, sw));
+    const rp = win(T, 0, 1.7);
+    I.ring.visible = rp > 0 && rp < 1;
+    I.ring.scale.setScalar(0.05 + rp * 1.5);
+    (I.ring.material as MeshBasicMaterial).opacity = (1 - rp) * 0.9;
+
+    const rise = Math.max(0.001, easeOutBack(win(T, 0.7, 2.0)));
+    for (const o of I.land) o.scale.y = rise;
+    if (I.trees) I.trees.scale.y = Math.max(0.001, easeOutBack(win(T, 1.4, 2.4)));
+    if (I.dome) (I.dome.material as MeshBasicMaterial).opacity = 0.8 * win(T, 1.8, 2.6);
+    if (I.glow) {
+      const g = easeInOut(win(T, 2.0, 3.4));
+      I.glow.geometry.setDrawRange(0, Math.floor((I.glowCount * g) / 6) * 6);
+    }
+    const ps = Math.max(0.001, easeOutBack(win(T, 6.9, 7.6)));
+    this.leaderboard.mesh.scale.setScalar(ps);
+    this.controls.mesh.scale.setScalar(ps);
+    this.pip.mesh.scale.setScalar(ps);
+    introState.boats = easeOutCubic(win(T, 2.6, 4.2));
+    introState.heli = easeInOut(win(T, 2.8, 5.0));
+
+    // cars drop onto the grid one by one
+    const order = this.sim.order;
+    for (let i = 0; i < order.length; i++) {
+      const root = this.carRoots[order[i].index];
+      const a = 3.6 + i * 0.12;
+      const p = win(T, a, a + 0.3);
+      root.visible = p > 0;
+      root.position.y += (1 - p) * (1 - p) * 0.12;
+      if (p >= 1 && this.introLanded <= i && !done) {
+        this.introLanded = i + 1;
+        this.audio.thud();
+      }
+    }
+    if (this.gantry) this.gantry.visible = T > 3.3;
+    for (const tr of this.trails) tr.geo.setDrawRange(0, T > 5.2 ? Infinity : 0);
+
+    // title card
+    const tin = win(T, 4.4, 5.0);
+    const tout = win(T, 6.4, 7.0);
+    const ta = tin * (1 - tout);
+    I.title.mesh.visible = ta > 0.001;
+    (I.title.mesh.material as MeshBasicMaterial).opacity = ta;
+    I.title.mesh.position.y = 0.17 + 0.03 * easeOutCubic(tin) + 0.03 * tout;
+    if (!this.introCued.chime && T >= 4.4) {
+      this.introCued.chime = true;
+      this.audio.chime();
+    }
+
+    if (done) {
+      this.introActive = false;
+      I.title.mesh.visible = false;
+      if (I.glow) I.glow.geometry.setDrawRange(0, Infinity);
+      if (this.autostartPending) {
+        this.sim.startLights();
+        this.sim.lightsTime = 5;
+        this.timeScale = this.autostartPending;
+        this.autostartPending = 0;
+        this.drawControls();
+      }
     }
   }
 

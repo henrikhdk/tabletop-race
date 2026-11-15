@@ -10,6 +10,7 @@ import {
 } from '@iwsdk/core';
 import { WATER_Y } from '../scene-assets/race-board.scene-asset.js';
 import { MeshBuilder } from './mesh-builder.js';
+import { introState } from './intro-state.js';
 import { RaceBoard } from './race-components.js';
 
 interface Boat {
@@ -192,6 +193,7 @@ export class DecorSystem extends createSystem({
       const dz = Math.cos(a) * b.rz * Math.sign(b.speed);
       b.obj.position.set(x, WATER_Y + 0.001 + Math.sin(t * 2 + b.phase) * 0.0006, z);
       b.obj.rotation.set(Math.sin(t * 1.7 + b.phase) * 0.04, Math.atan2(dx, dz), 0);
+      b.obj.scale.setScalar(Math.max(0.001, introState.boats));
     }
     if (this.heli && this.rotor && this.tailRotor && this.beacon && this.shadow) {
       // lazy figure-eight over the circuit, like a TV chopper following the race
@@ -201,7 +203,8 @@ export class DecorSystem extends createSystem({
       const y = 0.2 + Math.sin(a * 3) * 0.02;
       const dx = Math.cos(a) * 0.42;
       const dz = Math.cos(a * 2) * 0.26;
-      this.heli.position.set(x, y, z);
+      const k = 1 - introState.heli;
+      this.heli.position.set(x + k * 0.9, y + k * 0.35, z - k * 1.3);
       const yaw = Math.atan2(dx, dz);
       const ddx = -Math.sin(a) * 0.42;
       const ddz = -Math.sin(a * 2) * 0.52;
@@ -210,7 +213,8 @@ export class DecorSystem extends createSystem({
       this.rotor.rotation.y += delta * 40;
       this.tailRotor.rotation.x += delta * 60;
       this.beacon.visible = Math.sin(t * 6) > 0.6;
-      this.shadow.position.set(x, 0.033, z);
+      this.shadow.position.set(x + k * 0.9, 0.033, z - k * 1.3);
+      this.shadow.visible = k < 0.4;
     }
   }
 }
