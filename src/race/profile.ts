@@ -33,6 +33,6 @@ const POINTS = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1];
 /** your driver's finishing position scores championship-style points */
 export function scorePrediction(finishPos: number, won: boolean): { points: number; text: string } {
   const points = POINTS[finishPos - 1] ?? 0;
-  if (won) return { points, text: 'Your driver WON the race!' };
-  return { points, text: `Your driver finished P${finishPos}` };
+  if (won) return { points, text: 'You called the winner!' };
+  return { points, text: `Your pick finished P${finishPos}` };
 }

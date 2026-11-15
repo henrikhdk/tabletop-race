@@ -33,6 +33,7 @@ import { CarMarker, RaceBoard, UiButton } from './race-components.js';
 import { CarState, formatTime, RacePhase, RaceSim, TEAMS, tyreLife } from './race-sim.js';
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
 import { RaceAudio } from './race-audio.js';
+import { HandPlay } from './hand-play.js';
 import { easeInOut, easeOutBack, easeOutCubic, introState, win } from './intro-state.js';
 import { loadProfile, Profile, saveProfile, scorePrediction } from './profile.js';
 
@@ -114,6 +115,10 @@ export class RaceSystem extends createSystem({
   private lastScore: { points: number; text: string } | null = null;
   private onboardOn = true;
   private audio = new RaceAudio();
+  private hand?: HandPlay;
+  private speeds: number[] = [];
+  private lastDelta = 1 / 72;
+  private clock = 0;
   private lastLit = 0;
 
   private leaderboard!: CanvasPanel;
@@ -244,6 +249,14 @@ export class RaceSystem extends createSystem({
       this.world.createTransformEntity(mesh, boardEntity);
       this.trails.push({ pos, col, geo, rgb: hexToRgb(TEAMS[car.driver.team].color) });
     }
+
+    // the magic hand: cars drive up onto a flat palm and jump off it
+    const sparkRoot = new Group();
+    sparkRoot.name = 'spark-root';
+    this.world.createTransformEntity(sparkRoot, boardEntity);
+    this.hand = new HandPlay(this.world, boardEntity.object3D!, this.sim.cars.length, sparkRoot);
+    this.hand.onLand = (s) => this.audio.thud(s);
+    this.speeds = this.sim.cars.map(() => 0);
 
     // marker floating over the car you predicted
     const pick = new Mesh(
@@ -401,12 +414,12 @@ export class RaceSystem extends createSystem({
       case 'onboard':
         this.onboardOn = !this.onboardOn;
         break;
-      case 'push': {
+      case 'push-disabled': {
         const c = this.prediction >= 0 ? this.sim.cars[this.prediction] : undefined;
         if (c && this.sim.phase === RacePhase.Racing && c.pitting <= 0 && !c.finished) c.push = !c.push;
         break;
       }
-      case 'box':
+      case 'box-disabled':
         if (this.prediction >= 0) this.sim.requestPit(this.prediction);
         break;
       case 'place':
@@ -457,6 +470,8 @@ export class RaceSystem extends createSystem({
     if (prevPhase !== this.sim.phase) this.drawControls();
 
     if (this.introActive) this.introT += delta;
+    this.lastDelta = Math.min(delta, 0.05);
+    this.clock += delta;
     this.placeCars();
     const lit = this.sim.lightsOn;
     for (let i = 0; i < 5; i++) this.lights[i].material = i < lit ? this.lightOn : this.lightOff;
@@ -483,6 +498,7 @@ export class RaceSystem extends createSystem({
       this.drawLeaderboard();
       this.drawPip();
       this.drawStrategy();
+      if (this.sim.phase === RacePhase.Racing) this.drawControls();
     }
     this.frame++;
     if (this.fpsPanel) this.updateFps(delta);
@@ -512,6 +528,10 @@ export class RaceSystem extends createSystem({
     }
     this.updateTrails();
     if (this.introActive) this.applyIntro();
+    if (this.hand) {
+      for (const car of this.sim.cars) this.speeds[car.index] = car.speed * Math.max(this.timeScale, 0.0001);
+      this.hand.update(this.carRoots, this.speeds, this.lastDelta, this.clock);
+    }
     if (this.prediction >= 0) {
       const r = this.carRoots[this.prediction];
       this.pickMarker.visible = true;
@@ -559,7 +579,7 @@ export class RaceSystem extends createSystem({
       ctx.fillText('ÎLE LUMIÈRE', 512, 160);
       ctx.fillStyle = '#ffe14d';
       ctx.font = '600 32px system-ui, sans-serif';
-      ctx.fillText('Pick your driver. Run the pit wall.', 512, 228);
+      ctx.fillText('Put your hand on the track. Seriously.', 512, 228);
       title.commit();
     }
     this.intro = {
@@ -858,7 +878,8 @@ export class RaceSystem extends createSystem({
     const p = this.strategy;
     if (!p) return;
     const car = this.prediction >= 0 ? this.sim.cars[this.prediction] : undefined;
-    const show = !!car && this.sim.phase === RacePhase.Racing && !this.introActive;
+    // strategy mode parked for now (kept in code, hidden from the scene)
+    const show = false && !!car && this.sim.phase === RacePhase.Racing && !this.introActive;
     p.mesh.visible = show;
     if (!show || !car) return;
     const ctx = p.ctx;
@@ -927,11 +948,16 @@ export class RaceSystem extends createSystem({
     if (this.sim.phase === RacePhase.Grid)
       hint =
         this.prediction < 0
-          ? 'Pinch a car to pick YOUR DRIVER, then START'
+          ? 'Pinch a car to call the WINNER, then START'
           : `Your pick: ${this.sim.cars[this.prediction].driver.code}  ·  press START`;
     else if (this.sim.phase === RacePhase.Lights) hint = 'Lights...';
     else if (this.sim.phase === RacePhase.Racing)
-      hint = this.timeScale === 0 ? 'Paused' : this.prediction >= 0 ? 'Manage tyres: PUSH to attack, BOX for fresh tyres' : 'Pinch any car to ride onboard';
+      hint =
+        this.timeScale === 0
+          ? 'Paused'
+          : this.hand && this.hand.riding > 0
+            ? 'Hold it... and let them fly!'
+            : 'Rest your hand FLAT on the track!';
     else hint = this.lastScore ? `${this.lastScore.text}  (+${this.lastScore.points} pts)` : 'Race over';
     ctx.fillText(hint, 30, 48);
 

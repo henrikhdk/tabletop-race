@@ -99,7 +99,7 @@ export class RaceAudio {
   }
 
   /** short soft "thud" when a car lands on the grid */
-  thud() {
+  thud(strength = 0.6) {
     const ctx = this.ctx;
     if (!ctx) return;
     const t = ctx.currentTime;
@@ -108,7 +108,7 @@ export class RaceAudio {
     o.type = 'sine';
     o.frequency.setValueAtTime(180, t);
     o.frequency.exponentialRampToValueAtTime(60, t + 0.12);
-    g.gain.setValueAtTime(0.12, t);
+    g.gain.setValueAtTime(0.05 + 0.15 * strength, t);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
     o.connect(g).connect(ctx.destination);
     o.start(t);
