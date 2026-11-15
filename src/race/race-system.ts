@@ -30,7 +30,7 @@ import { hexToRgb, MeshBuilder } from './mesh-builder.js';
 
 const TRAIL_SEGMENTS = 24;
 import { CarMarker, RaceBoard, UiButton } from './race-components.js';
-import { CarState, formatTime, RacePhase, RaceSim, TEAMS } from './race-sim.js';
+import { CarState, formatTime, RacePhase, RaceSim, TEAMS, tyreLife } from './race-sim.js';
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
 import { RaceAudio } from './race-audio.js';
 import { easeInOut, easeOutBack, easeOutCubic, introState, win } from './intro-state.js';
@@ -43,6 +43,13 @@ const BUTTONS = [
   { id: 'onboard', label: 'ONBOARD', x: 762 },
   { id: 'place', label: 'PLACE', x: 1008 },
 ] as const;
+const STRAT_BUTTONS = [
+  { id: 'push', x: 24 },
+  { id: 'box', x: 332 },
+] as const;
+const STRAT_Y = 118;
+const STRAT_W = 284;
+const STRAT_H = 98;
 const BTN_Y = 92;
 const BTN_W = 230;
 const BTN_H = 96;
@@ -111,6 +118,7 @@ export class RaceSystem extends createSystem({
 
   private leaderboard!: CanvasPanel;
   private controls!: CanvasPanel;
+  private strategy!: CanvasPanel;
   private pip!: CanvasPanel;
   private pipFrame!: Mesh;
   private pipTarget!: WebGLRenderTarget;
@@ -296,6 +304,22 @@ export class RaceSystem extends createSystem({
       e.addComponent(RayInteractable);
     }
 
+    // ---- strategy panel: manage your driver (left of the controls) ------
+    this.strategy = new CanvasPanel(640, 240, 0.27, 'strategy');
+    this.strategy.mesh.position.set(-0.47, 0.06, 0.36);
+    this.strategy.mesh.rotation.set(-0.9, 0.3, 0, 'YXZ');
+    this.strategy.mesh.visible = false;
+    const strategyEntity = this.world.createTransformEntity(this.strategy.mesh, boardEntity);
+    for (const b of STRAT_BUTTONS) {
+      const r = this.strategy.rectToLocal(b.x, STRAT_Y, STRAT_W, STRAT_H);
+      const hit = new Mesh(new BoxGeometry(r.w, r.h, 0.01), btnMat);
+      hit.name = `btn-${b.id}`;
+      hit.position.set(r.cx, r.cy, 0.004);
+      const e = this.world.createTransformEntity(hit, strategyEntity);
+      e.addComponent(UiButton, { action: b.id });
+      e.addComponent(RayInteractable);
+    }
+
     // ---- onboard picture-in-picture (behind the board) ----------------
     this.pipTarget = new WebGLRenderTarget(384, 216);
     this.pipTarget.texture.colorSpace = SRGBColorSpace;
@@ -318,12 +342,19 @@ export class RaceSystem extends createSystem({
     // ?fps : small performance HUD next to the timing tower
     if (new URLSearchParams(location.search).has('fps')) {
       this.fpsPanel = new CanvasPanel(400, 150, 0.12, 'fps-hud');
-      this.fpsPanel.mesh.position.set(-0.36, 0.05, 0.38);
-      this.fpsPanel.mesh.rotation.set(-0.9, 0.25, 0, 'YXZ');
+      this.fpsPanel.mesh.position.set(0.4, 0.05, 0.4);
+      this.fpsPanel.mesh.rotation.set(-0.9, -0.25, 0, 'YXZ');
       this.world.createTransformEntity(this.fpsPanel.mesh, boardEntity);
     }
     // ?autostart&speed=4 : start immediately (handy for demo capture on desktop)
     const q = new URLSearchParams(location.search);
+    const pickCode = (q.get('driver') ?? '').toUpperCase();
+    const pickCar = this.sim.cars.find((c) => c.driver.code === pickCode);
+    if (pickCar) {
+      this.prediction = pickCar.index;
+      this.sim.playerCar = pickCar.index;
+      this.followed = pickCar.index;
+    }
     if (q.has('autostart')) this.autostartPending = Math.max(1, Math.min(8, Number(q.get('speed')) || 1));
     this.setupIntro(boardEntity);
     this.startIntro();
@@ -340,6 +371,7 @@ export class RaceSystem extends createSystem({
     this.audio.beep(this.sim.phase === RacePhase.Grid ? 880 : 660, 0.12, 0.12);
     if (this.sim.phase === RacePhase.Grid) {
       this.prediction = index;
+      this.sim.playerCar = index;
     }
     this.followed = index;
     this.onboardOn = true;
@@ -368,6 +400,14 @@ export class RaceSystem extends createSystem({
         break;
       case 'onboard':
         this.onboardOn = !this.onboardOn;
+        break;
+      case 'push': {
+        const c = this.prediction >= 0 ? this.sim.cars[this.prediction] : undefined;
+        if (c && this.sim.phase === RacePhase.Racing && c.pitting <= 0 && !c.finished) c.push = !c.push;
+        break;
+      }
+      case 'box':
+        if (this.prediction >= 0) this.sim.requestPit(this.prediction);
         break;
       case 'place':
         if (this.world.visibilityState.peek() !== VisibilityState.NonImmersive) {
@@ -442,6 +482,7 @@ export class RaceSystem extends createSystem({
       this.uiTimer = 0;
       this.drawLeaderboard();
       this.drawPip();
+      this.drawStrategy();
     }
     this.frame++;
     if (this.fpsPanel) this.updateFps(delta);
@@ -518,7 +559,7 @@ export class RaceSystem extends createSystem({
       ctx.fillText('ÎLE LUMIÈRE', 512, 160);
       ctx.fillStyle = '#ffe14d';
       ctx.font = '600 32px system-ui, sans-serif';
-      ctx.fillText('Pinch a car to call the winner', 512, 228);
+      ctx.fillText('Pick your driver. Run the pit wall.', 512, 228);
       title.commit();
     }
     this.intro = {
@@ -813,6 +854,66 @@ export class RaceSystem extends createSystem({
   }
 
   // ---------------------------------------------------------------------
+  private drawStrategy() {
+    const p = this.strategy;
+    if (!p) return;
+    const car = this.prediction >= 0 ? this.sim.cars[this.prediction] : undefined;
+    const show = !!car && this.sim.phase === RacePhase.Racing && !this.introActive;
+    p.mesh.visible = show;
+    if (!show || !car) return;
+    const ctx = p.ctx;
+    p.background(0.85);
+    const team = TEAMS[car.driver.team];
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#38f5ff';
+    ctx.font = '800 26px system-ui, sans-serif';
+    ctx.fillText('YOUR DRIVER', 28, 34);
+    ctx.fillStyle = team.color;
+    ctx.fillRect(196, 20, 8, 28);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '800 30px system-ui, sans-serif';
+    ctx.fillText(`${car.driver.code}  P${car.position}`, 214, 34);
+    // tyre gauge
+    const life = tyreLife(car.tyreAge);
+    const gx = 28;
+    const gy = 64;
+    const gw = 420;
+    roundRect(ctx, gx, gy, gw, 30, 15);
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.fill();
+    roundRect(ctx, gx, gy, Math.max(30, (gw * life) / 100), 30, 15);
+    ctx.fillStyle = life > 50 ? '#3dff8b' : life > 25 ? '#ffe14d' : '#ff3b5c';
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 24px system-ui, sans-serif';
+    ctx.fillText(`TYRES ${life}%`, gx + gw + 16, gy + 16);
+    for (const b of STRAT_BUTTONS) {
+      const hover = this.hoveredAction === b.id;
+      const active = b.id === 'push' ? car.push : car.pitting > 0;
+      roundRect(ctx, b.x, STRAT_Y, STRAT_W, STRAT_H, 22);
+      ctx.fillStyle = active
+        ? b.id === 'push'
+          ? 'rgba(255,59,92,0.55)'
+          : 'rgba(255,225,77,0.45)'
+        : hover
+          ? 'rgba(56,245,255,0.45)'
+          : 'rgba(255,255,255,0.10)';
+      ctx.fill();
+      ctx.lineWidth = hover ? 5 : 2;
+      ctx.strokeStyle = hover ? '#38f5ff' : 'rgba(255,255,255,0.35)';
+      ctx.stroke();
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.font = '800 34px system-ui, sans-serif';
+      const label =
+        b.id === 'push' ? (car.push ? 'PUSHING!' : 'PUSH') : car.pitting > 0 ? 'IN PIT...' : `BOX (${car.pits})`;
+      ctx.fillText(label, b.x + STRAT_W / 2, STRAT_Y + STRAT_H / 2 + 2);
+      ctx.textAlign = 'left';
+    }
+    p.commit();
+  }
+
   private drawControls() {
     const p = this.controls;
     if (!p) return;
@@ -826,11 +927,11 @@ export class RaceSystem extends createSystem({
     if (this.sim.phase === RacePhase.Grid)
       hint =
         this.prediction < 0
-          ? 'Pinch a car to predict the WINNER, then START'
+          ? 'Pinch a car to pick YOUR DRIVER, then START'
           : `Your pick: ${this.sim.cars[this.prediction].driver.code}  ·  press START`;
     else if (this.sim.phase === RacePhase.Lights) hint = 'Lights...';
     else if (this.sim.phase === RacePhase.Racing)
-      hint = this.timeScale === 0 ? 'Paused' : 'Pinch any car to ride onboard';
+      hint = this.timeScale === 0 ? 'Paused' : this.prediction >= 0 ? 'Manage tyres: PUSH to attack, BOX for fresh tyres' : 'Pinch any car to ride onboard';
     else hint = this.lastScore ? `${this.lastScore.text}  (+${this.lastScore.points} pts)` : 'Race over';
     ctx.fillText(hint, 30, 48);
 
@@ -915,6 +1016,10 @@ export class RaceSystem extends createSystem({
           gap = lapsDown >= 1 ? `+${lapsDown} LAP` : `+${sim.gapToLeader(car).toFixed(3)}`;
         }
       } else gap = team.name;
+      if (car.pitting > 0) {
+        gap = 'IN PIT';
+        ctx.fillStyle = '#ffe14d';
+      }
       ctx.fillText(gap, p.pxW - 28, y + rowH / 2);
     });
 

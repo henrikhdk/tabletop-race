@@ -28,10 +28,11 @@ export function saveProfile(p: Profile) {
   }
 }
 
-/** winner exact = 25, podium = 10, top 5 = 4, else 0 */
+const POINTS = [25, 18, 15, 12, 10, 8, 6, 4, 2, 1];
+
+/** your driver's finishing position scores championship-style points */
 export function scorePrediction(finishPos: number, won: boolean): { points: number; text: string } {
-  if (won) return { points: 25, text: 'Called the winner!' };
-  if (finishPos <= 3) return { points: 10, text: `Your pick finished P${finishPos}` };
-  if (finishPos <= 5) return { points: 4, text: `Your pick finished P${finishPos}` };
-  return { points: 0, text: `Your pick finished P${finishPos}` };
+  const points = POINTS[finishPos - 1] ?? 0;
+  if (won) return { points, text: 'Your driver WON the race!' };
+  return { points, text: `Your driver finished P${finishPos}` };
 }

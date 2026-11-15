@@ -55,7 +55,27 @@ export interface CarState {
   finishTime: number;
   position: number;
   form: number;
+  /** tyre age in laps-equivalent (push mode ages tyres faster) */
+  tyreAge: number;
+  push: boolean;
+  /** seconds left stationary in the pit box (0 = not pitting) */
+  pitting: number;
+  pits: number;
+  /** lap on which the AI plans its stop */
+  pitLap: number;
 }
+
+/** pace multiplier from tyre age: gentle drop, then a cliff after ~4 laps */
+export function tyreGrip(age: number): number {
+  const cliff = age > 4 ? 0.03 * Math.pow(age - 4, 1.3) : 0;
+  return Math.max(0.72, 1 - 0.01 * age - cliff);
+}
+/** 0..100 % of tyre life left, for display */
+export function tyreLife(age: number): number {
+  return Math.max(0, Math.round(100 - (age / 7) * 100));
+}
+
+const PIT_STOP = 2.4;
 
 function mulberry32(seed: number) {
   let a = seed >>> 0;
@@ -79,6 +99,8 @@ export class RaceSim {
   fastestLapCar = -1;
   /** small event log: newest first */
   events: string[] = [];
+  /** the car the viewer manages (-1 = none): the AI never pits it */
+  playerCar = -1;
   private rand: () => number;
   private readonly vmax = 0.24;
   private readonly cornerK = 0.045;
@@ -104,6 +126,11 @@ export class RaceSim {
       finishTime: 0,
       position: index + 1,
       form: 1,
+      tyreAge: 0,
+      push: false,
+      pitting: 0,
+      pits: 0,
+      pitLap: 3,
     }));
     this.order = this.cars.slice();
     this.reset(seed);
@@ -132,7 +159,13 @@ export class RaceSim {
       c.finished = false;
       c.finishTime = 0;
       c.form = 1 + (this.rand() - 0.5) * 0.02;
+      c.tyreAge = 0;
+      c.push = false;
+      c.pitting = 0;
+      c.pits = 0;
+      c.pitLap = Math.max(2, Math.round(this.totalLaps * (0.38 + this.rand() * 0.22)));
     });
+    this.playerCar = -1;
     this.sortOrder();
   }
 
@@ -181,9 +214,14 @@ export class RaceSim {
       allDone = false;
       const i = this.sampleIndex(car.dist);
       const k = this.track.curvature[i];
-      const wear = 1 - 0.006 * car.lap;
+      // tyres + strategy
+      car.tyreAge += ((car.speed * dt) / L) * (car.push ? 1.9 : 1);
+      if (car.index !== this.playerCar && car.pits === 0 && car.pitting <= 0 && car.lap >= car.pitLap && car.lap < this.totalLaps - 1) {
+        this.requestPit(car.index);
+      }
+      const grip = tyreGrip(car.tyreAge) * (car.push ? 1.03 : 1);
       let target =
-        (this.vmax * car.driver.skill * car.form * wear) / (1 + this.cornerK * k);
+        (this.vmax * car.driver.skill * car.form * grip) / (1 + this.cornerK * k);
       // Traffic: dirty air in corners, slipstream on straights.
       const ahead = this.carAhead(car);
       let wantLateral = car.lateral * 0.98;
@@ -193,6 +231,18 @@ export class RaceSim {
           if (k > 6) target = Math.min(target, ahead.speed * 1.0);
           else target *= 1.04; // slipstream
           if (gap < 0.03) wantLateral = ahead.lateral > 0 ? -0.011 : 0.011;
+        }
+      }
+      if (car.pitting > 0) {
+        // in the pit box: crawl along the pit lane edge, then fresh tyres
+        target = 0.035;
+        wantLateral = 0.034;
+        car.pitting -= dt;
+        if (car.pitting <= 0) {
+          car.pitting = 0;
+          car.tyreAge = 0;
+          car.pits += 1;
+          this.pushEvent(`${car.driver.code} OUT OF THE PITS`);
         }
       }
       // accelerate / brake smoothly
@@ -236,6 +286,16 @@ export class RaceSim {
     if (allDone) this.phase = RacePhase.Finished;
   }
 
+  /** send a car to the pits (ignored if already pitting or not racing) */
+  requestPit(index: number): boolean {
+    const car = this.cars[index];
+    if (this.phase !== RacePhase.Racing || car.finished || car.pitting > 0) return false;
+    car.pitting = PIT_STOP;
+    car.push = false;
+    this.pushEvent(`${car.driver.code} PITS`);
+    return true;
+  }
+
   /** gap to leader in seconds (approximate, using average speed) */
   gapToLeader(car: CarState): number {
     const leader = this.order[0];
@@ -246,7 +306,7 @@ export class RaceSim {
     let best: CarState | undefined;
     let bestGap = Infinity;
     for (const o of this.cars) {
-      if (o === car) continue;
+      if (o === car || o.pitting > 0) continue;
       const g = o.dist - car.dist;
       if (g > 0 && g < bestGap) {
         bestGap = g;
