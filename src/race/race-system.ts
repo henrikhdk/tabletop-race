@@ -18,6 +18,7 @@ import {
   SRGBColorSpace,
   Vector3,
   VisibilityState,
+  XRPlane,
   WebGLRenderTarget,
 } from '@iwsdk/core';
 import { CanvasPanel, roundRect } from './canvas-panel.js';
@@ -32,6 +33,7 @@ const BUTTONS = [
   { id: 'restart', label: 'NEW RACE', x: 270 },
   { id: 'speed', label: 'SPEED 1x', x: 516 },
   { id: 'onboard', label: 'ONBOARD', x: 762 },
+  { id: 'place', label: 'PLACE', x: 1008 },
 ] as const;
 const BTN_Y = 92;
 const BTN_W = 230;
@@ -68,7 +70,18 @@ export class RaceSystem extends createSystem({
   buttons: { required: [UiButton] },
   buttonPressed: { required: [UiButton, Pressed] },
   buttonHovered: { required: [UiButton, Hovered] },
+  planes: { required: [XRPlane] },
 }) {
+  // --- table anchoring (mixed reality) ---
+  private placement: 'authored' | 'table' | 'front' = 'authored';
+  private xrTime = 0;
+  private autoPlaced = false;
+  private boxMin = new Vector3();
+  private boxMax = new Vector3();
+  private tmpA = new Vector3();
+  private tmpB = new Vector3();
+  private tmpTry = new Vector3();
+
   private track!: TrackSample;
   private sim!: RaceSim;
   private board?: Entity;
@@ -209,7 +222,7 @@ export class RaceSystem extends createSystem({
     this.world.createTransformEntity(this.leaderboard.mesh, boardEntity);
 
     // ---- control strip (front edge, tilted up to the viewer) ----------
-    this.controls = new CanvasPanel(1016, 210, 0.46, 'controls');
+    this.controls = new CanvasPanel(1262, 210, 0.56, 'controls');
     this.controls.mesh.position.set(0, 0.045, 0.39);
     this.controls.mesh.rotation.x = -0.9;
     const controlsEntity = this.world.createTransformEntity(this.controls.mesh, boardEntity);
@@ -281,6 +294,9 @@ export class RaceSystem extends createSystem({
       case 'onboard':
         this.onboardOn = !this.onboardOn;
         break;
+      case 'place':
+        if (this.placement === 'table' || !this.placeOnTable()) this.placeInFront();
+        break;
     }
     this.drawAll();
   }
@@ -297,6 +313,18 @@ export class RaceSystem extends createSystem({
     // dark studio backdrop on flat screens; passthrough (no background) in XR
     const vis = this.world.visibilityState.peek();
     this.world.scene.background = vis === VisibilityState.NonImmersive ? this.flatBg : null;
+    if (vis === VisibilityState.NonImmersive) {
+      this.xrTime = 0;
+      this.autoPlaced = false;
+    } else if (!this.autoPlaced) {
+      // give plane detection a moment, then snap to the real table (or float in front)
+      this.xrTime += delta;
+      if (this.xrTime > 1.2 && this.placeOnTable()) this.autoPlaced = true;
+      else if (this.xrTime > 4) {
+        this.placeInFront();
+        this.autoPlaced = true;
+      }
+    }
     if (this.world.visibilityState.peek() === VisibilityState.VisibleBlurred) return;
     const dt = Math.min(delta, 0.05);
     const prevPhase = this.sim.phase;
@@ -349,6 +377,85 @@ export class RaceSystem extends createSystem({
     } else {
       this.pickMarker.visible = false;
     }
+  }
+
+  /** Find the best horizontal plane at table height (prefers ones labelled "table"). */
+  private placeOnTable(): boolean {
+    if (!this.board) return false;
+    const head = this.player.head;
+    head.getWorldPosition(this.tmpA);
+    head.getWorldDirection(this.tmpTry);
+    const fwdSign = (head as { isCamera?: boolean }).isCamera ? 1 : -1;
+    const fx = this.tmpTry.x * fwdSign;
+    const fz = this.tmpTry.z * fwdSign;
+    let best: { score: number; cx: number; cy: number; cz: number; w: number; d: number } | null = null;
+    for (const e of this.queries.planes.entities) {
+      const plane = e.getValue(XRPlane, '_plane') as unknown as {
+        orientation?: string;
+        semanticLabel?: string;
+        polygon: DOMPointReadOnly[];
+      };
+      const obj = e.object3D;
+      if (!plane || !obj || plane.orientation !== 'horizontal') continue;
+      obj.updateWorldMatrix(true, false);
+      this.boxMin.set(Infinity, 0, Infinity);
+      this.boxMax.set(-Infinity, 0, -Infinity);
+      for (const pt of plane.polygon) {
+        this.boxMin.x = Math.min(this.boxMin.x, pt.x);
+        this.boxMin.z = Math.min(this.boxMin.z, pt.z);
+        this.boxMax.x = Math.max(this.boxMax.x, pt.x);
+        this.boxMax.z = Math.max(this.boxMax.z, pt.z);
+      }
+      const w = this.boxMax.x - this.boxMin.x;
+      const d = this.boxMax.z - this.boxMin.z;
+      this.tmpB.set((this.boxMin.x + this.boxMax.x) / 2, 0, (this.boxMin.z + this.boxMax.z) / 2);
+      obj.localToWorld(this.tmpB);
+      const label = (plane.semanticLabel ?? '').toLowerCase();
+      if (label === 'floor' || label === 'ceiling') continue;
+      if (this.tmpB.y < 0.35 || this.tmpB.y > 1.25 || Math.max(w, d) < 0.35) continue;
+      const dist = Math.hypot(this.tmpB.x - this.tmpA.x, this.tmpB.z - this.tmpA.z);
+      if (dist > 3) continue;
+      const facing = (this.tmpB.x - this.tmpA.x) * fx + (this.tmpB.z - this.tmpA.z) * fz;
+      const score = dist + (label === 'table' || label === 'desk' ? 0 : 1) + (facing < 0 ? 2.5 : 0);
+      if (!best || score < best.score) best = { score, cx: this.tmpB.x, cy: this.tmpB.y, cz: this.tmpB.z, w, d };
+    }
+    if (!best) return false;
+    const s = Math.min(1, Math.max(0.5, Math.min(Math.max(best.w, best.d) / 1.1, Math.min(best.w, best.d) / 0.66)));
+    this.placement = 'table';
+    this.setBoardPose(best.cx, best.cy + 0.002, best.cz, s);
+    console.info('[race] table plane', JSON.stringify(best));
+    this.sim.events.unshift('BOARD PLACED ON YOUR TABLE');
+    return true;
+  }
+
+  /** No table found: float the board in front of the seated viewer. */
+  private placeInFront() {
+    const head = this.player.head;
+    head.getWorldPosition(this.tmpA);
+    head.getWorldDirection(this.tmpB);
+    // three's getWorldDirection on a camera-like object points to -z; flatten
+    this.tmpB.y = 0;
+    if (this.tmpB.lengthSq() < 1e-4) this.tmpB.set(0, 0, -1);
+    this.tmpB.normalize();
+    // Object3D.getWorldDirection returns +z; cameras look down -z
+    const sign = (head as { isCamera?: boolean }).isCamera ? 1 : -1;
+    this.placement = 'front';
+    this.setBoardPose(
+      this.tmpA.x + this.tmpB.x * 0.6 * sign,
+      this.tmpA.y - 0.42,
+      this.tmpA.z + this.tmpB.z * 0.6 * sign,
+      0.85,
+    );
+    this.placement = 'front';
+  }
+
+  private setBoardPose(x: number, y: number, z: number, scale: number) {
+    const obj = this.board!.object3D!;
+    this.player.head.getWorldPosition(this.tmpA);
+    obj.position.set(x, y, z);
+    obj.rotation.set(0, Math.atan2(this.tmpA.x - x, this.tmpA.z - z), 0);
+    obj.scale.setScalar(scale);
+    console.info(`[race] board placed (${this.placement}) at`, x.toFixed(2), y.toFixed(2), z.toFixed(2), 'scale', scale.toFixed(2));
   }
 
   private renderOnboard() {
