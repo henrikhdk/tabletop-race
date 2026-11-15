@@ -13,24 +13,25 @@ export interface DriverDef {
 }
 
 export const TEAMS: TeamDef[] = [
-  { name: 'Aurora Racing', color: '#ff3b5c' },
-  { name: 'Volt Works', color: '#2ee6ff' },
-  { name: 'Ember Motorsport', color: '#ff9b1f' },
-  { name: 'Nimbus GP', color: '#b06bff' },
-  { name: 'Verdant Speed', color: '#3dff8b' },
+  { name: 'Taco Torpedo', color: '#ff7a1a' },
+  { name: 'Pizza Bolt', color: '#ff3b5c' },
+  { name: 'Sushi Express', color: '#2ee6ff' },
+  { name: 'Waffle Wagon', color: '#b06bff' },
+  { name: 'Kale Kart', color: '#3dff8b' },
+  { name: 'Your Truck', color: '#ffe14d' },
 ];
 
 export const DRIVERS: DriverDef[] = [
-  { code: 'VEX', name: 'Ilya Vexley', team: 0, skill: 1.0 },
-  { code: 'MAR', name: 'Sol Marenco', team: 0, skill: 0.985 },
-  { code: 'KAI', name: 'Kai Okonkwo', team: 1, skill: 0.995 },
-  { code: 'LUN', name: 'Mira Lund', team: 1, skill: 0.98 },
-  { code: 'RAZ', name: 'Teo Razzari', team: 2, skill: 0.99 },
-  { code: 'BEL', name: 'Ana Belmonte', team: 2, skill: 0.975 },
-  { code: 'HAL', name: 'Jun Halloran', team: 3, skill: 0.983 },
-  { code: 'QUI', name: 'Rafa Quintela', team: 3, skill: 0.97 },
-  { code: 'DRA', name: 'Noor Draxler', team: 4, skill: 0.978 },
-  { code: 'FEN', name: 'Lia Fenwick', team: 4, skill: 0.965 },
+  { code: 'TAC', name: 'Taco Tina', team: 0, skill: 1.0 },
+  { code: 'NAC', name: 'Nacho Nate', team: 0, skill: 0.985 },
+  { code: 'PEP', name: 'Pepperoni Pia', team: 1, skill: 0.995 },
+  { code: 'MOZ', name: 'Mozz Marco', team: 1, skill: 0.98 },
+  { code: 'MAK', name: 'Maki Mo', team: 2, skill: 0.99 },
+  { code: 'WAS', name: 'Wasabi Wu', team: 2, skill: 0.975 },
+  { code: 'YOU', name: 'You', team: 5, skill: 0.985 },
+  { code: 'SYR', name: 'Syrup Sam', team: 3, skill: 0.97 },
+  { code: 'KAL', name: 'Kale Kim', team: 4, skill: 0.978 },
+  { code: 'SPR', name: 'Sprout Sol', team: 4, skill: 0.965 },
 ];
 
 export const enum RacePhase {
@@ -112,6 +113,10 @@ export class RaceSim {
   humanDrives = false;
   /** demo/bot driver for the player's car (?autodrive): lifts just before corners */
   autoDrive = false;
+  /** handling multipliers from the truck the player built */
+  playerTop = 1;
+  playerGrip = 1;
+  playerAccel = 1;
   crashes = 0;
   onCrash?: (car: CarState) => void;
   private rand: () => number;
@@ -219,7 +224,7 @@ export class RaceSim {
     const v = car.speed;
     for (let j = 0; j < 80; j++) {
       const k = this.track.curvature[this.sampleIndex(car.dist + j * ds)];
-      const lim = ((this.vmax * car.driver.skill * grip) / (1 + this.cornerK * k)) * 1.17;
+      const lim = ((this.vmax * car.driver.skill * grip * this.playerGrip) / (1 + this.cornerK * k)) * 1.17;
       if (v > lim && (v * v - lim * lim) / (2 * 0.95) >= j * ds - 0.004) return false;
     }
     return true;
@@ -274,9 +279,9 @@ export class RaceSim {
           if (car.crashT <= 0) car.crashT = 0;
           continue;
         }
-        const limit = (this.vmax * car.driver.skill * grip) / (1 + this.cornerK * k);
+        const limit = (this.vmax * car.driver.skill * grip * this.playerGrip) / (1 + this.cornerK * k);
         if (this.autoDrive) this.throttle = this.botThrottle(car, grip) ? 1 : 0;
-        target = this.throttle > 0.5 ? this.vmax * 1.04 * grip : 0;
+        target = this.throttle > 0.5 ? this.vmax * 1.04 * grip * this.playerTop : 0;
         if (car.speed > limit * 1.25) car.overT += dt;
         else car.overT = Math.max(0, car.overT - dt * 2);
         if (car.overT > 0.1) {
@@ -288,7 +293,7 @@ export class RaceSim {
           car.speed = 0;
           continue;
         }
-        const acc = target > car.speed ? 0.24 : 0.95;
+        const acc = target > car.speed ? 0.24 * this.playerAccel : 0.95;
         car.speed += Math.sign(target - car.speed) * Math.min(Math.abs(target - car.speed), acc * dt);
         car.lateral += (wantLateral - car.lateral) * Math.min(1, dt * 3);
         const b0 = car.dist;

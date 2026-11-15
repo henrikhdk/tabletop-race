@@ -5,6 +5,7 @@ import {
   BufferGeometry,
   Color,
   createSystem,
+  CylinderGeometry,
   DoubleSide,
   Entity,
   Group,
@@ -34,6 +35,17 @@ import { CarState, CRASH_TIME, formatTime, RacePhase, RaceSim, TEAMS, tyreLife }
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
 import { RaceAudio } from './race-audio.js';
 import { HandPlay } from './hand-play.js';
+import { Build, buildStats, SLOT_NAMES, SLOTS, TruckModel } from './food-truck.js';
+
+const PLAYER = 6; // grid slot P7: you start mid-pack
+// garage panel layout (canvas px)
+const G_W = 1262;
+const G_H = 660;
+const G_ROW_Y = [92, 214, 336];
+const G_ROW_H = 106;
+const G_OPT_X = [236, 580, 924];
+const G_OPT_W = 322;
+const G_RACE = { x: 760, y: 470, w: 478, h: 150 };
 import { easeInOut, easeOutBack, easeOutCubic, introState, win } from './intro-state.js';
 import { loadProfile, Profile, saveProfile, scorePrediction } from './profile.js';
 
@@ -124,6 +136,14 @@ export class RaceSystem extends createSystem({
   private pinchHeld = [false, false];
   private keyGas = false;
   private crashLanded: boolean[] = [];
+  // --- food truck garage ---
+  private mode: 'garage' | 'deliver' | 'race' = 'garage';
+  private trucks: TruckModel[] = [];
+  private garage!: { root: Group; spin: Group; truck: TruckModel; panel: CanvasPanel };
+  private build: Build = [-1, -1, -1];
+  private partDrop = [9, 9, 9];
+  private deliverT = 0;
+  private garageShown = 0;
 
   private leaderboard!: CanvasPanel;
   private controls!: CanvasPanel;
@@ -198,10 +218,12 @@ export class RaceSystem extends createSystem({
       this.queries.buttonHovered.subscribe('qualify', (e) => {
         this.hoveredAction = e.getValue(UiButton, 'action') ?? '';
         this.drawControls();
+        this.drawGarage();
       }),
       this.queries.buttonHovered.subscribe('disqualify', () => {
         this.hoveredAction = '';
         this.drawControls();
+        this.drawGarage();
       }),
     );
   }
@@ -213,7 +235,6 @@ export class RaceSystem extends createSystem({
     this.sim = new RaceSim(this.track, Date.now() % 100000, laps);
 
     // ---- cars --------------------------------------------------------
-    const carGeo = buildCarGeometry();
     const ringGeo = new RingGeometry(0.009, 0.0125, 24);
     ringGeo.rotateX(-Math.PI / 2);
     const haloGeo = new SphereGeometry(0.0035, 10, 8);
@@ -224,13 +245,15 @@ export class RaceSystem extends createSystem({
       const team = TEAMS[car.driver.team];
       const root = new Group();
       root.name = `car-${car.driver.code}`;
-      const bodyMat = new MeshStandardMaterial({ color: team.color, roughness: 0.4, metalness: 0.3, vertexColors: true });
-      const body = new Mesh(carGeo, bodyMat);
-      body.name = 'body';
-      root.add(body);
+      const truck = new TruckModel(team.color);
+      // rivals get a random-but-fixed combo; yours is built in the garage
+      truck.setBuild(car.index === PLAYER ? [0, 0, 0] : [car.index % 3, (car.index * 2 + 1) % 3, (car.index * 5 + 2) % 3]);
+      truck.group.name = 'body';
+      root.add(truck.group);
+      this.trucks.push(truck);
       const glowMat = new MeshBasicMaterial({ color: team.color, transparent: true, opacity: 0.9, blending: AdditiveBlending, depthWrite: false });
       const halo = new Mesh(haloGeo, glowMat);
-      halo.position.set(0, 0.016, 0);
+      halo.position.set(0, 0.026, 0);
       root.add(halo);
       const ring = new Mesh(ringGeo, glowMat.clone());
       ring.position.y = 0.0008;
@@ -336,6 +359,8 @@ export class RaceSystem extends createSystem({
       e.addComponent(RayInteractable);
     }
 
+    this.setupGarage(boardEntity, btnMat);
+
     // ---- strategy panel: manage your driver (left of the controls) ------
     this.strategy = new CanvasPanel(640, 240, 0.27, 'strategy');
     this.strategy.mesh.position.set(-0.47, 0.06, 0.36);
@@ -380,19 +405,14 @@ export class RaceSystem extends createSystem({
     }
     // ?autostart&speed=4 : start immediately (handy for demo capture on desktop)
     const q = new URLSearchParams(location.search);
-    const pickCode = (q.get('driver') ?? '').toUpperCase();
-    const pickCar = this.sim.cars.find((c) => c.driver.code === pickCode);
-    if (pickCar) {
-      this.prediction = pickCar.index;
-      this.sim.playerCar = pickCar.index;
-      this.sim.humanDrives = true;
-      this.followed = pickCar.index;
-    }
+    this.claimPlayer();
+    if (q.has('debug')) (window as unknown as { __ft: unknown }).__ft = this;
     this.sim.autoDrive = q.has('autodrive');
     this.sim.onCrash = (car) => {
       const r = this.carRoots[car.index];
-      this.hand?.burst(r.position.x, r.position.y, r.position.z, 1);
+      this.hand?.burst(r.position.x, r.position.y, r.position.z, 1, true);
       this.audio.thud(1);
+      this.audio.honk(3);
       this.crashLanded[car.index] = false;
       this.drawControls();
     };
@@ -412,11 +432,7 @@ export class RaceSystem extends createSystem({
     // while you drive, every pinch is the gas pedal: never switch cars mid-race
     if (this.sim.humanDrives && this.sim.phase !== RacePhase.Grid && this.sim.phase !== RacePhase.Finished) return;
     this.audio.beep(this.sim.phase === RacePhase.Grid ? 880 : 660, 0.12, 0.12);
-    if (this.sim.phase === RacePhase.Grid) {
-      this.prediction = index;
-      this.sim.playerCar = index;
-      this.sim.humanDrives = true;
-    }
+
     this.followed = index;
     this.onboardOn = true;
     this.drawAll();
@@ -427,19 +443,30 @@ export class RaceSystem extends createSystem({
     this.audio.unlock();
     // driving: a pinch aimed at the panel is the throttle, not a button press
     if (this.sim.humanDrives && (this.sim.phase === RacePhase.Racing || this.sim.phase === RacePhase.Lights)) return;
+    if (action.startsWith('part:')) {
+      if (this.mode !== 'garage') return;
+      const [, sl, op] = action.split(':');
+      this.pickPart(Number(sl), Number(op));
+      return;
+    }
+    if (action === 'race') {
+      if (this.mode === 'garage' && this.build.every((b) => b >= 0)) this.startDeliver();
+      return;
+    }
     this.audio.click();
     switch (action) {
       case 'start':
-        if (this.sim.phase === RacePhase.Grid) this.sim.startLights();
-        else if (this.timeScale === 0) this.timeScale = 1;
+        if (this.sim.phase === RacePhase.Grid) {
+          if (this.mode === 'race') this.sim.startLights();
+        } else if (this.timeScale === 0) this.timeScale = 1;
         else if (this.sim.phase === RacePhase.Racing) this.timeScale = 0;
         break;
       case 'restart':
         this.sim.reset();
-        this.prediction = -1;
+        this.claimPlayer();
         this.lastScore = null;
         this.timeScale = 1;
-        this.followed = this.sim.order[0].index;
+        this.enterGarage();
         break;
       case 'speed':
         this.timeScale = this.timeScale >= 4 ? 1 : this.timeScale * 2;
@@ -504,6 +531,7 @@ export class RaceSystem extends createSystem({
     if (prevPhase !== this.sim.phase) this.drawControls();
 
     if (this.introActive) this.introT += delta;
+    this.updateGarage(delta);
     this.lastDelta = Math.min(delta, 0.05);
     this.clock += delta;
     this.placeCars();
@@ -563,6 +591,7 @@ export class RaceSystem extends createSystem({
     }
     this.updateTrails();
     if (this.introActive) this.applyIntro();
+    if (this.mode !== 'race') this.carRoots[PLAYER].visible = false;
     if (this.hand) {
       for (const car of this.sim.cars) this.speeds[car.index] = car.speed * Math.max(this.timeScale, 0.0001);
       this.hand.update(this.carRoots, this.speeds, this.lastDelta, this.clock);
@@ -574,6 +603,217 @@ export class RaceSystem extends createSystem({
     } else {
       this.pickMarker.visible = false;
     }
+  }
+
+  private claimPlayer() {
+    this.prediction = PLAYER;
+    this.sim.playerCar = PLAYER;
+    this.sim.humanDrives = true;
+    this.followed = PLAYER;
+  }
+
+  /** big display truck on a turntable + the build panel */
+  private setupGarage(boardEntity: Entity, btnMat: MeshBasicMaterial) {
+    const root = new Group();
+    root.name = 'garage';
+    root.position.set(0, 0.09, 0.02);
+    const deck = new Mesh(
+      new CylinderGeometry(0.15, 0.16, 0.012, 48),
+      new MeshStandardMaterial({ color: '#1b2433', roughness: 0.5, metalness: 0.4 }),
+    );
+    deck.position.y = -0.006;
+    root.add(deck);
+    const rimGeo = new RingGeometry(0.15, 0.158, 64);
+    rimGeo.rotateX(-Math.PI / 2);
+    const rim = new Mesh(rimGeo, new MeshBasicMaterial({ color: '#ffb21a', transparent: true, opacity: 0.9, blending: AdditiveBlending, depthWrite: false }));
+    rim.position.y = 0.0005;
+    root.add(rim);
+    const spin = new Group();
+    root.add(spin);
+    const truck = new TruckModel(TEAMS[5].color);
+    truck.group.scale.setScalar(9);
+    spin.add(truck.group);
+    root.scale.setScalar(0.0001);
+    this.world.createTransformEntity(root, boardEntity);
+
+    const panel = new CanvasPanel(G_W, G_H, 0.46, 'garage-panel');
+    panel.mesh.position.set(0, 0.075, 0.44);
+    panel.mesh.rotation.x = -0.85;
+    panel.mesh.scale.setScalar(0.0001);
+    const pe = this.world.createTransformEntity(panel.mesh, boardEntity);
+    const addHit = (x: number, y: number, w: number, h: number, action: string) => {
+      const r = panel.rectToLocal(x, y, w, h);
+      const hit = new Mesh(new BoxGeometry(r.w, r.h, 0.01), btnMat);
+      hit.name = `btn-${action}`;
+      hit.position.set(r.cx, r.cy, 0.004);
+      const e = this.world.createTransformEntity(hit, pe);
+      e.addComponent(UiButton, { action });
+      e.addComponent(RayInteractable);
+    };
+    for (let sl = 0; sl < 3; sl++)
+      for (let op = 0; op < 3; op++) addHit(G_OPT_X[op], G_ROW_Y[sl], G_OPT_W, G_ROW_H, `part:${sl}:${op}`);
+    addHit(G_RACE.x, G_RACE.y, G_RACE.w, G_RACE.h, 'race');
+    this.garage = { root, spin, truck, panel };
+    this.drawGarage();
+  }
+
+  private pickPart(slot: number, option: number) {
+    this.audio.unlock();
+    this.build[slot] = option;
+    this.garage.truck.setPart(slot, option);
+    this.partDrop[slot] = 0;
+    this.audio.pop();
+    this.drawGarage();
+  }
+
+  /** your truck shrinks and flies down onto its grid slot, then the lights start */
+  private startDeliver() {
+    this.mode = 'deliver';
+    this.deliverT = 0;
+    this.trucks[PLAYER].setBuild(this.build);
+    const st = buildStats(this.build);
+    this.sim.playerTop = st.top;
+    this.sim.playerGrip = st.grip;
+    this.sim.playerAccel = st.accel;
+    this.audio.honk(2);
+  }
+
+  private enterGarage() {
+    this.mode = 'garage';
+    this.garage.root.position.set(0, 0.09, 0.02);
+    this.garage.spin.rotation.set(0, 0, 0);
+    this.drawGarage();
+  }
+
+  private updateGarage(delta: number) {
+    const G = this.garage;
+    if (!G) return;
+    const show = this.mode !== 'race' && !this.introActive ? 1 : this.mode !== 'race' ? this.garageShown : 0;
+    if (this.mode === 'garage') {
+      G.spin.rotation.y += delta * 0.5;
+      G.root.scale.setScalar(Math.max(0.0001, show));
+      G.panel.mesh.scale.setScalar(Math.max(0.0001, show));
+      this.controls.mesh.scale.setScalar(0.0001);
+      for (let sl = 0; sl < 3; sl++) {
+        const part = G.truck.parts[sl];
+        if (!part) continue;
+        this.partDrop[sl] += delta;
+        const a = Math.min(1, this.partDrop[sl] / 0.45);
+        const lift = (1 - easeOutBack(a)) * 0.02;
+        part.position.y = G.truck.baseY(sl) + lift;
+        if (a >= 1 && !part.userData.landed) {
+          part.userData.landed = true;
+          this.audio.thud(0.8);
+        }
+      }
+      return;
+    }
+    if (this.mode === 'deliver') {
+      this.deliverT += delta;
+      const a = Math.min(1, this.deliverT / 1.1);
+      const e = easeInOut(a);
+      G.panel.mesh.scale.setScalar(Math.max(0.0001, 1 - Math.min(1, a * 3)));
+      const target = this.carRoots[PLAYER];
+      // fly from the turntable to the grid slot, shrinking 9x -> 1x
+      G.root.position.set(
+        target.position.x * e,
+        0.09 + (target.position.y - 0.09) * e + Math.sin(a * Math.PI) * 0.12,
+        0.02 + (target.position.z - 0.02) * e,
+      );
+      G.spin.rotation.y += (target.rotation.y - G.spin.rotation.y) * Math.min(1, delta * 6 + e * 0.2);
+      G.root.scale.setScalar(Math.max(0.0001, 1 - e * (1 - 1 / 9)));
+      G.root.children[0].visible = a < 0.3;
+      G.root.children[1].visible = a < 0.3;
+      if (a >= 1) {
+        this.mode = 'race';
+        G.root.scale.setScalar(0.0001);
+        G.root.children[0].visible = true;
+        G.root.children[1].visible = true;
+        this.carRoots[PLAYER].visible = true;
+        this.audio.thud(1);
+        this.hand?.burst(target.position.x, target.position.y, target.position.z, 0.6, true);
+        this.controls.mesh.scale.setScalar(1);
+        this.sim.startLights();
+        this.drawControls();
+      }
+    }
+  }
+
+  private drawGarage() {
+    const G = this.garage;
+    if (!G) return;
+    const p = G.panel;
+    const ctx = p.ctx;
+    p.background(0.86);
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffb21a';
+    ctx.font = '900 44px system-ui, sans-serif';
+    ctx.fillText('BUILD YOUR FOOD TRUCK', 28, 46);
+    ctx.fillStyle = '#cfe9ff';
+    ctx.font = '600 28px system-ui, sans-serif';
+    ctx.textAlign = 'right';
+    ctx.fillText('pinch a part to bolt it on', G_W - 28, 48);
+    for (let sl = 0; sl < 3; sl++) {
+      const y = G_ROW_Y[sl];
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#8fb3d9';
+      ctx.font = '800 30px system-ui, sans-serif';
+      ctx.fillText(SLOT_NAMES[sl], 28, y + G_ROW_H / 2);
+      for (let op = 0; op < 3; op++) {
+        const x = G_OPT_X[op];
+        const sel = this.build[sl] === op;
+        const hover = this.hoveredAction === `part:${sl}:${op}`;
+        roundRect(ctx, x, y, G_OPT_W, G_ROW_H, 22);
+        ctx.fillStyle = sel ? 'rgba(255,178,26,0.55)' : hover ? 'rgba(56,245,255,0.35)' : 'rgba(255,255,255,0.09)';
+        ctx.fill();
+        ctx.lineWidth = sel || hover ? 5 : 2;
+        ctx.strokeStyle = sel ? '#ffd23a' : hover ? '#38f5ff' : 'rgba(255,255,255,0.3)';
+        ctx.stroke();
+        const part = SLOTS[sl][op];
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '900 36px system-ui, sans-serif';
+        ctx.fillText(part.name, x + G_OPT_W / 2, y + 40);
+        ctx.fillStyle = sel ? '#fff6c8' : '#9fb4cc';
+        ctx.font = '600 22px system-ui, sans-serif';
+        ctx.fillText(part.blurb, x + G_OPT_W / 2, y + 78);
+      }
+    }
+    // stats bars
+    const st = buildStats(this.build);
+    const rows: [string, number][] = [
+      ['SPEED', st.top],
+      ['GRIP', st.grip],
+      ['ACCEL', st.accel],
+    ];
+    ctx.textAlign = 'left';
+    rows.forEach(([label, v], i) => {
+      const y = 482 + i * 52;
+      ctx.fillStyle = '#8fb3d9';
+      ctx.font = '800 26px system-ui, sans-serif';
+      ctx.fillText(label, 28, y + 16);
+      roundRect(ctx, 160, y, 560, 32, 16);
+      ctx.fillStyle = 'rgba(255,255,255,0.1)';
+      ctx.fill();
+      const f = Math.max(0.08, Math.min(1, 0.5 + (v - 1) * (label === 'ACCEL' ? 1.2 : 3.5)));
+      roundRect(ctx, 160, y, 560 * f, 32, 16);
+      ctx.fillStyle = ['#ff7a1a', '#3dff8b', '#2ee6ff'][i];
+      ctx.fill();
+    });
+    const ready = this.build.every((b) => b >= 0);
+    const hover = this.hoveredAction === 'race';
+    roundRect(ctx, G_RACE.x, G_RACE.y, G_RACE.w, G_RACE.h, 30);
+    ctx.fillStyle = ready ? (hover ? 'rgba(61,255,139,0.75)' : 'rgba(46,217,168,0.5)') : 'rgba(255,255,255,0.06)';
+    ctx.fill();
+    ctx.lineWidth = hover && ready ? 6 : 2;
+    ctx.strokeStyle = ready ? '#3dff8b' : 'rgba(255,255,255,0.2)';
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = ready ? '#ffffff' : 'rgba(255,255,255,0.35)';
+    ctx.font = '900 52px system-ui, sans-serif';
+    ctx.fillText(ready ? "LET'S RACE!" : `${this.build.filter((b) => b < 0).length} PARTS LEFT`, G_RACE.x + G_RACE.w / 2, G_RACE.y + G_RACE.h / 2 + 2);
+    p.commit();
   }
 
   /** off-track excursion: fly straight on, tumble, sit in the gravel, roll back */
@@ -595,7 +835,7 @@ export class RaceSystem extends createSystem({
       if (!this.crashLanded[car.index]) {
         this.crashLanded[car.index] = true;
         this.tmpLook.copy(root.position).addScaledVector(tan, out);
-        this.hand?.burst(this.tmpLook.x, this.tmpLook.y, this.tmpLook.z, 0.7);
+        this.hand?.burst(this.tmpLook.x, this.tmpLook.y, this.tmpLook.z, 0.7, true);
         this.audio.thud(0.7);
       }
     } else {
@@ -673,13 +913,13 @@ export class RaceSystem extends createSystem({
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#38f5ff';
       ctx.font = '700 34px system-ui, sans-serif';
-      ctx.fillText('LUMEN GRAND CIRCUIT  ·  ROUND 1', 512, 88);
+      ctx.fillText('THE GREASY GRAND PRIX  ·  ROUND 1', 512, 88);
       ctx.fillStyle = '#ffffff';
       ctx.font = '900 96px system-ui, sans-serif';
-      ctx.fillText('ÎLE LUMIÈRE', 512, 160);
+      ctx.fillText('FOOD TRUCK RALLY', 512, 160);
       ctx.fillStyle = '#ffe14d';
       ctx.font = '600 32px system-ui, sans-serif';
-      ctx.fillText('Put your hand on the track. Seriously.', 512, 228);
+      ctx.fillText('Build it. Race it. Don\'t spill the salsa.', 512, 228);
       title.commit();
     }
     this.intro = {
@@ -732,7 +972,8 @@ export class RaceSystem extends createSystem({
     }
     const ps = Math.max(0.001, easeOutBack(win(T, 6.9, 7.6)));
     this.leaderboard.mesh.scale.setScalar(ps);
-    this.controls.mesh.scale.setScalar(ps);
+    this.controls.mesh.scale.setScalar(this.mode === 'race' ? ps : 0.0001);
+    this.garageShown = ps;
     this.pip.mesh.scale.setScalar(ps);
     introState.boats = easeOutCubic(win(T, 2.6, 4.2));
     introState.heli = easeInOut(win(T, 2.8, 5.0));
@@ -770,7 +1011,11 @@ export class RaceSystem extends createSystem({
       I.title.mesh.visible = false;
       if (I.glow) I.glow.geometry.setDrawRange(0, Infinity);
       if (this.autostartPending) {
-        this.sim.startLights();
+        for (let sl = 0; sl < 3; sl++) if (this.build[sl] < 0) this.pickPart(sl, sl === 1 ? 0 : sl === 2 ? 1 : 2);
+        this.partDrop = [9, 9, 9];
+        this.startDeliver();
+        this.deliverT = 9;
+        this.updateGarage(0);
         this.sim.lightsTime = 5;
         this.timeScale = this.autostartPending;
         this.autostartPending = 0;
@@ -958,6 +1203,7 @@ export class RaceSystem extends createSystem({
     if (this.sim.humanDrives && this.prediction >= 0) {
       const me = this.sim.cars[this.prediction];
       const pts = scorePrediction(me.position, false).points;
+      this.audio.honk(me.position === 1 ? 5 : 2);
       const crash = this.sim.crashes === 0 ? 'clean race!' : `${this.sim.crashes} crash${this.sim.crashes > 1 ? 'es' : ''}`;
       this.lastScore = { points: pts, text: me.position === 1 ? `YOU WON! ${crash}` : `You finished P${me.position}, ${crash}` };
       this.profile.points += pts;
@@ -1057,10 +1303,7 @@ export class RaceSystem extends createSystem({
     ctx.textAlign = 'left';
     let hint = '';
     if (this.sim.phase === RacePhase.Grid)
-      hint =
-        this.prediction < 0
-          ? 'Pinch a car to DRIVE it, then START'
-          : `You drive ${this.sim.cars[this.prediction].driver.code}  ·  press START`;
+      hint = this.mode === 'race' ? 'Pinch START when ready' : 'Build your truck first!';
     else if (this.sim.phase === RacePhase.Lights)
       hint = this.sim.humanDrives ? 'Get ready... PINCH & HOLD = GAS' : 'Lights...';
     else if (this.sim.phase === RacePhase.Racing && this.sim.humanDrives && this.prediction >= 0) {
@@ -1111,7 +1354,7 @@ export class RaceSystem extends createSystem({
     ctx.textAlign = 'left';
     ctx.fillStyle = '#38f5ff';
     ctx.font = '800 30px system-ui, sans-serif';
-    ctx.fillText('LUMEN GRAND CIRCUIT', 28, 46);
+    ctx.fillText('GREASY GRAND PRIX', 28, 46);
     ctx.fillStyle = '#ffffff';
     ctx.font = '700 40px system-ui, sans-serif';
     const lapText =

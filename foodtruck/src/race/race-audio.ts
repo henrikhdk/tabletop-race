@@ -115,6 +115,50 @@ export class RaceAudio {
     o.stop(t + 0.17);
   }
 
+  /** goofy two-tone truck horn: "la-cucaracha" lite */
+  honk(times = 2) {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const t0 = ctx.currentTime;
+    for (let n = 0; n < times; n++) {
+      const t = t0 + n * 0.17;
+      const g = ctx.createGain();
+      const f = ctx.createBiquadFilter();
+      f.type = 'lowpass';
+      f.frequency.value = 2200;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.12, t + 0.015);
+      g.gain.setValueAtTime(0.12, t + 0.11);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+      for (const fr of n % 2 ? [392, 494] : [440, 554]) {
+        const o = ctx.createOscillator();
+        o.type = 'sawtooth';
+        o.frequency.value = fr;
+        o.connect(f);
+        o.start(t);
+        o.stop(t + 0.16);
+      }
+      f.connect(g).connect(ctx.destination);
+    }
+  }
+
+  /** cartoon "pop" when a part snaps on */
+  pop() {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = 'sine';
+    o.frequency.setValueAtTime(320, t);
+    o.frequency.exponentialRampToValueAtTime(1200, t + 0.07);
+    g.gain.setValueAtTime(0.18, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    o.connect(g).connect(ctx.destination);
+    o.start(t);
+    o.stop(t + 0.13);
+  }
+
   click() {
     this.beep(1400, 0.05, 0.08);
   }

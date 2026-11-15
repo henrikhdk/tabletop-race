@@ -24,7 +24,15 @@ interface Palm {
   halfWid: number;
 }
 
-const SPARKS = 160;
+const SPARKS = 320;
+const SPARK: [number, number, number] = [1, 0.55, 0.15];
+const FOOD: [number, number, number][] = [
+  [0.9, 0.08, 0.05], // salsa
+  [1, 0.75, 0.05], // cheese
+  [0.25, 0.8, 0.15], // lettuce
+  [0.75, 0.45, 0.15], // bread
+  [1, 1, 0.9], // onion
+];
 
 /**
  * The "magic hand": rest your hand flat on the track and the cars drive up
@@ -46,6 +54,7 @@ export class HandPlay {
   private sparkPos: Float32Array;
   private sparkVel: Float32Array;
   private sparkLife: Float32Array;
+  private sparkCol: Float32Array;
   private sparkGeo: BufferGeometry;
   private sparkNext = 0;
   private tmp = new Vector3();
@@ -73,9 +82,11 @@ export class HandPlay {
     this.sparkLife = new Float32Array(SPARKS);
     this.sparkGeo = new BufferGeometry();
     this.sparkGeo.setAttribute('position', new BufferAttribute(this.sparkPos, 3));
+    this.sparkCol = new Float32Array(SPARKS * 3);
+    this.sparkGeo.setAttribute('color', new BufferAttribute(this.sparkCol, 3));
     const pts = new Points(
       this.sparkGeo,
-      new PointsMaterial({ color: '#ffb347', size: 0.0035, transparent: true, blending: AdditiveBlending, depthWrite: false }),
+      new PointsMaterial({ vertexColors: true, size: 0.0042, transparent: true, depthWrite: false }),
     );
     pts.frustumCulled = false;
     pts.name = 'sparks';
@@ -233,8 +244,9 @@ export class HandPlay {
     this.updateSparks(dt);
   }
 
-  burst(x: number, y: number, z: number, strength: number) {
-    const n = Math.floor(14 + strength * 26);
+  /** sparks, or (food=true) a spray of salsa, cheese, lettuce and bread */
+  burst(x: number, y: number, z: number, strength: number, food = false) {
+    const n = Math.floor((food ? 40 : 14) + strength * (food ? 50 : 26));
     for (let k = 0; k < n; k++) {
       const i = this.sparkNext;
       this.sparkNext = (this.sparkNext + 1) % SPARKS;
@@ -246,8 +258,13 @@ export class HandPlay {
       this.sparkVel[i * 3] = Math.cos(a) * sp;
       this.sparkVel[i * 3 + 1] = 0.15 + Math.random() * 0.35 * strength;
       this.sparkVel[i * 3 + 2] = Math.sin(a) * sp;
-      this.sparkLife[i] = 0.25 + Math.random() * 0.35;
+      this.sparkLife[i] = (food ? 0.5 : 0.25) + Math.random() * 0.35;
+      const c = food ? FOOD[Math.floor(Math.random() * FOOD.length)] : SPARK;
+      this.sparkCol[i * 3] = c[0];
+      this.sparkCol[i * 3 + 1] = c[1];
+      this.sparkCol[i * 3 + 2] = c[2];
     }
+    (this.sparkGeo.getAttribute('color') as BufferAttribute).needsUpdate = true;
   }
 
   private updateSparks(dt: number) {
