@@ -1,8 +1,11 @@
 import {
   AdditiveBlending,
   BoxGeometry,
+  BufferAttribute,
+  BufferGeometry,
   Color,
   createSystem,
+  DoubleSide,
   Entity,
   Group,
   Hovered,
@@ -22,7 +25,9 @@ import {
   WebGLRenderTarget,
 } from '@iwsdk/core';
 import { CanvasPanel, roundRect } from './canvas-panel.js';
-import { MeshBuilder } from './mesh-builder.js';
+import { hexToRgb, MeshBuilder } from './mesh-builder.js';
+
+const TRAIL_SEGMENTS = 24;
 import { CarMarker, RaceBoard, UiButton } from './race-components.js';
 import { CarState, formatTime, RacePhase, RaceSim, TEAMS } from './race-sim.js';
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
@@ -88,6 +93,10 @@ export class RaceSystem extends createSystem({
   private board?: Entity;
   private carRoots: Group[] = [];
   private carRings: Mesh[] = [];
+  private trails: { pos: Float32Array; col: Float32Array; geo: BufferGeometry; rgb: [number, number, number] }[] = [];
+  private trailPos = new Vector3();
+  private trailTan = new Vector3();
+  private trailNor = new Vector3();
   private pickMarker!: Mesh;
   private timeScale = 1;
   private profile!: Profile;
@@ -182,6 +191,29 @@ export class RaceSystem extends createSystem({
       this.carRoots.push(root);
     }
 
+    // light trails behind every car (one small dynamic strip each)
+    const N = TRAIL_SEGMENTS;
+    const index: number[] = [];
+    for (let k = 0; k < N; k++) {
+      const a = k * 2;
+      index.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+    }
+    const trailMat = new MeshBasicMaterial({ vertexColors: true, transparent: true, blending: AdditiveBlending, depthWrite: false, side: DoubleSide });
+    for (const car of this.sim.cars) {
+      const geo = new BufferGeometry();
+      const pos = new Float32Array((N + 1) * 2 * 3);
+      const col = new Float32Array((N + 1) * 2 * 3);
+      geo.setAttribute('position', new BufferAttribute(pos, 3));
+      geo.setAttribute('color', new BufferAttribute(col, 3));
+      geo.setIndex(index);
+      const mesh = new Mesh(geo, trailMat);
+      mesh.name = `trail-${car.driver.code}`;
+      mesh.frustumCulled = false;
+      mesh.renderOrder = 5;
+      this.world.createTransformEntity(mesh, boardEntity);
+      this.trails.push({ pos, col, geo, rgb: hexToRgb(TEAMS[car.driver.team].color) });
+    }
+
     // marker floating over the car you predicted
     const pick = new Mesh(
       new SphereGeometry(0.005, 12, 8),
@@ -259,6 +291,13 @@ export class RaceSystem extends createSystem({
     this.world.createTransformEntity(this.pipFrame, pipEntity);
 
     this.followed = this.sim.order[0].index;
+    // ?autostart&speed=4 : start immediately (handy for demo capture on desktop)
+    const q = new URLSearchParams(location.search);
+    if (q.has('autostart')) {
+      this.sim.startLights();
+      this.sim.lightsTime = 5;
+      this.timeScale = Math.max(1, Math.min(8, Number(q.get('speed')) || 1));
+    }
     this.placeCars();
     this.drawControls();
     this.drawLeaderboard();
@@ -385,6 +424,7 @@ export class RaceSystem extends createSystem({
       root.rotation.set(0, Math.atan2(tan.x + this.track.tangents[i1].x, tan.z + this.track.tangents[i1].z), 0);
       this.carRings[car.index].visible = car.index === this.followed;
     }
+    this.updateTrails();
     if (this.prediction >= 0) {
       const r = this.carRoots[this.prediction];
       this.pickMarker.visible = true;
@@ -471,6 +511,51 @@ export class RaceSystem extends createSystem({
     obj.rotation.set(0, Math.atan2(this.tmpA.x - x, this.tmpA.z - z), 0);
     obj.scale.setScalar(scale);
     console.info(`[race] board placed (${this.placement}) at`, x.toFixed(2), y.toFixed(2), z.toFixed(2), 'scale', scale.toFixed(2));
+  }
+
+  /** position + tangent on the centreline at a race distance, offset sideways */
+  private trackAt(dist: number, lateral: number, out: Vector3, tan: Vector3) {
+    const n = this.track.points.length - 1;
+    const L = this.track.length;
+    const d = ((dist % L) + L) % L;
+    const f = (d / L) * n;
+    const i0 = Math.floor(f) % n;
+    const t = f - Math.floor(f);
+    out.lerpVectors(this.track.points[i0], this.track.points[(i0 + 1) % n], t);
+    tan.copy(this.track.tangents[i0]);
+    this.trailNor.crossVectors(this.up, tan).normalize();
+    out.addScaledVector(this.trailNor, lateral);
+  }
+
+  private updateTrails() {
+    const N = TRAIL_SEGMENTS;
+    const racing = this.sim.phase === RacePhase.Racing || this.sim.phase === RacePhase.Finished;
+    for (const car of this.sim.cars) {
+      const tr = this.trails[car.index];
+      const len = racing ? Math.min(0.16, car.speed * 0.55) : 0;
+      for (let k = 0; k <= N; k++) {
+        const u = k / N;
+        this.trackAt(car.dist - 0.006 - len * u, car.lateral, this.trailPos, this.trailTan);
+        // normal is left in trailNor by trackAt
+        const w = 0.0032 * (1 - u * 0.85);
+        const y = TRACK_SURFACE_Y + 0.0022;
+        const o = k * 6;
+        tr.pos[o] = this.trailPos.x + this.trailNor.x * w;
+        tr.pos[o + 1] = y;
+        tr.pos[o + 2] = this.trailPos.z + this.trailNor.z * w;
+        tr.pos[o + 3] = this.trailPos.x - this.trailNor.x * w;
+        tr.pos[o + 4] = y;
+        tr.pos[o + 5] = this.trailPos.z - this.trailNor.z * w;
+        const fade = Math.pow(1 - u, 1.6) * (car.index === this.followed ? 1.6 : 1);
+        for (let v = 0; v < 2; v++) {
+          tr.col[o + v * 3] = Math.min(1, tr.rgb[0] * fade + 0.15 * fade);
+          tr.col[o + v * 3 + 1] = Math.min(1, tr.rgb[1] * fade + 0.15 * fade);
+          tr.col[o + v * 3 + 2] = Math.min(1, tr.rgb[2] * fade + 0.15 * fade);
+        }
+      }
+      (tr.geo.getAttribute('position') as BufferAttribute).needsUpdate = true;
+      (tr.geo.getAttribute('color') as BufferAttribute).needsUpdate = true;
+    }
   }
 
   private renderOnboard() {

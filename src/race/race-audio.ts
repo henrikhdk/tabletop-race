@@ -44,7 +44,7 @@ export class RaceAudio {
   }
 
   beep(freq: number, dur = 0.18, vol = 0.18) {
-    const ctx = this.ensure();
+    const ctx = this.ctx; // only after unlock() from a user gesture
     if (!ctx) return;
     const o = ctx.createOscillator();
     const g = ctx.createGain();

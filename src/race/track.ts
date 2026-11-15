@@ -1,30 +1,35 @@
 import { CatmullRomCurve3, Vector3 } from '@iwsdk/core';
 
 /**
- * The circuit "Porto Lumen" — an original fictional street circuit.
+ * "Ile Lumiere" — a fictional island street circuit whose flow is inspired by
+ * classic island-park circuits: a short pit straight into a left/right S,
+ * flowing esses along the south shore, a tight hairpin at the far end, a long
+ * back straight and a quick final chicane before the line.
  * Board-local coordinates in meters: X right, Z towards the viewer, Y up.
- * The board is ~1.10 m wide and ~0.66 m deep and sits on a real table.
  */
 const CONTROL_POINTS: ReadonlyArray<readonly [number, number]> = [
-  [-0.38, 0.2], // start/finish straight (front)
-  [-0.05, 0.22],
-  [0.28, 0.22],
-  [0.43, 0.16], // T1 sweeping right
-  [0.47, 0.02],
-  [0.4, -0.08],
-  [0.28, -0.06], // T3 hairpin entry
-  [0.2, -0.12],
-  [0.27, -0.21],
-  [0.4, -0.24], // back section
-  [0.42, -0.27],
-  [0.25, -0.28],
-  [0.02, -0.26],
-  [-0.12, -0.18], // chicane
-  [-0.2, -0.24],
-  [-0.34, -0.25],
-  [-0.46, -0.18], // final hairpin
-  [-0.49, -0.04],
-  [-0.46, 0.1],
+  [-0.3, -0.1], // start / finish
+  [-0.4, -0.095],
+  [-0.47, -0.055], // T1 left
+  [-0.445, 0.0], // T2 right
+  [-0.48, 0.055],
+  [-0.42, 0.105], // T3/T4
+  [-0.3, 0.115],
+  [-0.18, 0.085], // kink
+  [-0.06, 0.12], // T6/T7
+  [0.05, 0.085],
+  [0.16, 0.115], // T8/T9
+  [0.23, 0.075],
+  [0.34, 0.095],
+  [0.44, 0.075],
+  [0.495, 0.02], // hairpin
+  [0.465, -0.035],
+  [0.38, -0.055],
+  [0.15, -0.09], // back straight
+  [-0.1, -0.125],
+  [-0.165, -0.125], // final chicane
+  [-0.195, -0.095],
+  [-0.235, -0.115],
 ];
 
 export const TRACK_HALF_WIDTH = 0.022;
