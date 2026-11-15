@@ -1,0 +1,280 @@
+import type { TrackSample } from './track.js';
+
+/** Fictional league: "Lumen Grand Circuit". No real teams, drivers or brands. */
+export interface TeamDef {
+  name: string;
+  color: string;
+}
+export interface DriverDef {
+  code: string;
+  name: string;
+  team: number;
+  skill: number;
+}
+
+export const TEAMS: TeamDef[] = [
+  { name: 'Aurora Racing', color: '#ff3b5c' },
+  { name: 'Volt Works', color: '#2ee6ff' },
+  { name: 'Ember Motorsport', color: '#ff9b1f' },
+  { name: 'Nimbus GP', color: '#b06bff' },
+  { name: 'Verdant Speed', color: '#3dff8b' },
+];
+
+export const DRIVERS: DriverDef[] = [
+  { code: 'VEX', name: 'Ilya Vexley', team: 0, skill: 1.0 },
+  { code: 'MAR', name: 'Sol Marenco', team: 0, skill: 0.985 },
+  { code: 'KAI', name: 'Kai Okonkwo', team: 1, skill: 0.995 },
+  { code: 'LUN', name: 'Mira Lund', team: 1, skill: 0.98 },
+  { code: 'RAZ', name: 'Teo Razzari', team: 2, skill: 0.99 },
+  { code: 'BEL', name: 'Ana Belmonte', team: 2, skill: 0.975 },
+  { code: 'HAL', name: 'Jun Halloran', team: 3, skill: 0.983 },
+  { code: 'QUI', name: 'Rafa Quintela', team: 3, skill: 0.97 },
+  { code: 'DRA', name: 'Noor Draxler', team: 4, skill: 0.978 },
+  { code: 'FEN', name: 'Lia Fenwick', team: 4, skill: 0.965 },
+];
+
+export const enum RacePhase {
+  Grid = 0,
+  Lights = 1,
+  Racing = 2,
+  Finished = 3,
+}
+
+export interface CarState {
+  index: number;
+  driver: DriverDef;
+  /** total distance travelled in meters (laps * length + lap progress) */
+  dist: number;
+  speed: number;
+  lateral: number;
+  lap: number;
+  lapStart: number;
+  lastLap: number;
+  bestLap: number;
+  finished: boolean;
+  finishTime: number;
+  position: number;
+  form: number;
+}
+
+function mulberry32(seed: number) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+export class RaceSim {
+  readonly cars: CarState[];
+  readonly order: CarState[];
+  phase = RacePhase.Grid;
+  time = 0;
+  lightsTime = 0;
+  totalLaps: number;
+  fastestLap = Infinity;
+  fastestLapCar = -1;
+  /** small event log: newest first */
+  events: string[] = [];
+  private rand: () => number;
+  private readonly vmax = 0.24;
+  private readonly cornerK = 0.045;
+
+  constructor(
+    private readonly track: TrackSample,
+    seed = 1,
+    laps = 8,
+  ) {
+    this.totalLaps = laps;
+    this.rand = mulberry32(seed);
+    this.cars = DRIVERS.map((driver, index) => ({
+      index,
+      driver,
+      dist: 0,
+      speed: 0,
+      lateral: 0,
+      lap: 0,
+      lapStart: 0,
+      lastLap: 0,
+      bestLap: Infinity,
+      finished: false,
+      finishTime: 0,
+      position: index + 1,
+      form: 1,
+    }));
+    this.order = this.cars.slice();
+    this.reset(seed);
+  }
+
+  reset(seed = Math.floor(Math.random() * 1e9)) {
+    this.rand = mulberry32(seed);
+    this.phase = RacePhase.Grid;
+    this.time = 0;
+    this.lightsTime = 0;
+    this.fastestLap = Infinity;
+    this.fastestLapCar = -1;
+    this.events = [];
+    // Shuffle the grid a little: qualifying is skill + luck.
+    const grid = this.cars
+      .map((c) => ({ c, q: c.driver.skill + (this.rand() - 0.5) * 0.03 }))
+      .sort((a, b) => b.q - a.q);
+    grid.forEach(({ c }, slot) => {
+      c.dist = -0.06 - slot * 0.075;
+      c.lateral = slot % 2 === 0 ? -0.009 : 0.009;
+      c.speed = 0;
+      c.lap = 0;
+      c.lapStart = 0;
+      c.lastLap = 0;
+      c.bestLap = Infinity;
+      c.finished = false;
+      c.finishTime = 0;
+      c.form = 1 + (this.rand() - 0.5) * 0.02;
+    });
+    this.sortOrder();
+  }
+
+  startLights() {
+    if (this.phase === RacePhase.Grid) {
+      this.phase = RacePhase.Lights;
+      this.lightsTime = 0;
+    }
+  }
+
+  /** number of red lights lit (0..5) during the start sequence */
+  get lightsOn(): number {
+    if (this.phase !== RacePhase.Lights) return 0;
+    return Math.min(5, Math.floor(this.lightsTime / 0.8) + 1);
+  }
+
+  get leaderLap(): number {
+    return Math.min(this.totalLaps, Math.max(1, this.order[0].lap + 1));
+  }
+
+  sampleIndex(dist: number): number {
+    const L = this.track.length;
+    const d = ((dist % L) + L) % L;
+    return Math.min(this.track.points.length - 1, Math.floor((d / L) * (this.track.points.length - 1)));
+  }
+
+  step(dt: number) {
+    if (this.phase === RacePhase.Grid || this.phase === RacePhase.Finished) return;
+    if (this.phase === RacePhase.Lights) {
+      this.lightsTime += dt;
+      if (this.lightsTime > 4 + 0.4 + this.rand() * 0.02) {
+        this.phase = RacePhase.Racing;
+        this.pushEvent('LIGHTS OUT!');
+      }
+      return;
+    }
+    this.time += dt;
+    const L = this.track.length;
+    let allDone = true;
+    for (const car of this.order) {
+      if (car.finished) {
+        // cool-down lap, slow
+        car.dist += 0.06 * dt;
+        continue;
+      }
+      allDone = false;
+      const i = this.sampleIndex(car.dist);
+      const k = this.track.curvature[i];
+      const wear = 1 - 0.006 * car.lap;
+      let target =
+        (this.vmax * car.driver.skill * car.form * wear) / (1 + this.cornerK * k);
+      // Traffic: dirty air in corners, slipstream on straights.
+      const ahead = this.carAhead(car);
+      let wantLateral = car.lateral * 0.98;
+      if (ahead) {
+        const gap = ahead.dist - car.dist;
+        if (gap < 0.05) {
+          if (k > 6) target = Math.min(target, ahead.speed * 1.0);
+          else target *= 1.04; // slipstream
+          if (gap < 0.03) wantLateral = ahead.lateral > 0 ? -0.011 : 0.011;
+        }
+      }
+      // accelerate / brake smoothly
+      const accel = target > car.speed ? 0.18 : 0.6;
+      car.speed += Math.sign(target - car.speed) * Math.min(Math.abs(target - car.speed), accel * dt);
+      car.lateral += (wantLateral - car.lateral) * Math.min(1, dt * 3);
+      const before = car.dist;
+      car.dist += car.speed * dt;
+      // lap completion
+      if (Math.floor(car.dist / L) > Math.floor(before / L) && car.dist > 0) {
+        const lapTime = this.time - car.lapStart;
+        if (car.lap > 0 || before >= 0) {
+          car.lastLap = lapTime;
+          if (lapTime < car.bestLap) car.bestLap = lapTime;
+          if (car.lap > 0 && lapTime < this.fastestLap) {
+            this.fastestLap = lapTime;
+            this.fastestLapCar = car.index;
+            this.pushEvent(`FASTEST LAP  ${car.driver.code}  ${formatTime(lapTime)}`);
+          }
+        }
+        car.lap += 1;
+        car.lapStart = this.time;
+        car.form = 1 + (this.rand() - 0.5) * 0.025;
+        if (car.lap >= this.totalLaps) {
+          car.finished = true;
+          car.finishTime = this.time;
+          if (this.order[0] === car) this.pushEvent(`${car.driver.code} WINS!`);
+        }
+      }
+    }
+    const prev = this.order.map((c) => c.index);
+    this.sortOrder();
+    for (let p = 0; p < this.order.length; p++) {
+      const c = this.order[p];
+      const was = prev.indexOf(c.index);
+      if (was > p && !c.finished && this.phase === RacePhase.Racing) {
+        const passed = this.cars[prev[p]];
+        if (passed && was === p + 1) this.pushEvent(`${c.driver.code} PASSES ${passed.driver.code} FOR P${p + 1}`);
+      }
+    }
+    if (allDone) this.phase = RacePhase.Finished;
+  }
+
+  /** gap to leader in seconds (approximate, using average speed) */
+  gapToLeader(car: CarState): number {
+    const leader = this.order[0];
+    return (leader.dist - car.dist) / (this.vmax * 0.75);
+  }
+
+  private carAhead(car: CarState): CarState | undefined {
+    let best: CarState | undefined;
+    let bestGap = Infinity;
+    for (const o of this.cars) {
+      if (o === car) continue;
+      const g = o.dist - car.dist;
+      if (g > 0 && g < bestGap) {
+        bestGap = g;
+        best = o;
+      }
+    }
+    return best;
+  }
+
+  private sortOrder() {
+    this.order.sort((a, b) => {
+      if (a.finished && b.finished) return a.finishTime - b.finishTime;
+      if (a.finished) return -1;
+      if (b.finished) return 1;
+      return b.dist - a.dist;
+    });
+    this.order.forEach((c, i) => (c.position = i + 1));
+  }
+
+  private pushEvent(text: string) {
+    this.events.unshift(text);
+    if (this.events.length > 4) this.events.length = 4;
+  }
+}
+
+export function formatTime(t: number): string {
+  if (!isFinite(t)) return '--.---';
+  const m = Math.floor(t / 60);
+  const s = t - m * 60;
+  return m > 0 ? `${m}:${s.toFixed(3).padStart(6, '0')}` : s.toFixed(3);
+}
