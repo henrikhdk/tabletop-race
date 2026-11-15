@@ -428,6 +428,14 @@ export class RaceSystem extends createSystem({
     const fc = this.followed >= 0 ? this.sim.cars[this.followed] : undefined;
     const racing = this.sim.phase === RacePhase.Racing && this.timeScale > 0;
     this.audio.engine(fc ? Math.min(1, fc.speed / 0.24) : 0, racing ? 1 : 0);
+    if (fc && racing) {
+      const head = this.player.head;
+      head.updateWorldMatrix(true, false);
+      const e = head.matrixWorld.elements;
+      // camera-like: forward = -Z column, up = +Y column
+      this.carRoots[fc.index].getWorldPosition(this.tmpA);
+      this.audio.place(e[12], e[13], e[14], -e[8], -e[9], -e[10], e[4], e[5], e[6], this.tmpA.x, this.tmpA.y, this.tmpA.z);
+    }
 
     this.uiTimer += delta;
     if (this.uiTimer > 0.25) {

@@ -4,6 +4,7 @@ export class RaceAudio {
   private engineGain?: GainNode;
   private engineOsc?: OscillatorNode;
   private engineOsc2?: OscillatorNode;
+  private panner?: PannerNode;
 
   private ensure() {
     if (this.ctx) return this.ctx;
@@ -25,7 +26,14 @@ export class RaceAudio {
       g2.gain.value = 0.35;
       o1.connect(filter);
       o2.connect(g2).connect(filter);
-      filter.connect(g).connect(ctx.destination);
+      // HRTF panner: the engine note comes from the followed car's real position
+      const panner = ctx.createPanner();
+      panner.panningModel = 'HRTF';
+      panner.distanceModel = 'inverse';
+      panner.refDistance = 0.25;
+      panner.rolloffFactor = 1.2;
+      filter.connect(panner).connect(g).connect(ctx.destination);
+      this.panner = panner;
       o1.start();
       o2.start();
       this.engineGain = g;
@@ -127,6 +135,36 @@ export class RaceAudio {
     this.beep(1400, 0.05, 0.08);
   }
 
+  /** place listener (head) and source (car) in world space, metres */
+  place(
+    lx: number, ly: number, lz: number,
+    fx: number, fy: number, fz: number,
+    ux: number, uy: number, uz: number,
+    sx: number, sy: number, sz: number,
+  ) {
+    const ctx = this.ctx;
+    if (!ctx || !this.panner) return;
+    const L = ctx.listener;
+    const t = ctx.currentTime;
+    if (L.positionX) {
+      L.positionX.setTargetAtTime(lx, t, 0.02);
+      L.positionY.setTargetAtTime(ly, t, 0.02);
+      L.positionZ.setTargetAtTime(lz, t, 0.02);
+      L.forwardX.setTargetAtTime(fx, t, 0.02);
+      L.forwardY.setTargetAtTime(fy, t, 0.02);
+      L.forwardZ.setTargetAtTime(fz, t, 0.02);
+      L.upX.setTargetAtTime(ux, t, 0.02);
+      L.upY.setTargetAtTime(uy, t, 0.02);
+      L.upZ.setTargetAtTime(uz, t, 0.02);
+    } else {
+      L.setPosition(lx, ly, lz);
+      L.setOrientation(fx, fy, fz, ux, uy, uz);
+    }
+    this.panner.positionX.setTargetAtTime(sx, t, 0.02);
+    this.panner.positionY.setTargetAtTime(sy, t, 0.02);
+    this.panner.positionZ.setTargetAtTime(sz, t, 0.02);
+  }
+
   /** pace 0..1 (follow-car speed / max), volume 0..1 */
   engine(pace: number, volume: number) {
     if (!this.ctx || !this.engineGain || !this.engineOsc || !this.engineOsc2) return;
@@ -134,6 +172,6 @@ export class RaceAudio {
     const f = 70 + pace * 190;
     this.engineOsc.frequency.setTargetAtTime(f, t, 0.08);
     this.engineOsc2.frequency.setTargetAtTime(f * 1.5, t, 0.08);
-    this.engineGain.gain.setTargetAtTime(volume * 0.05, t, 0.2);
+    this.engineGain.gain.setTargetAtTime(volume * 0.12, t, 0.2);
   }
 }
