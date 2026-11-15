@@ -63,7 +63,12 @@ export interface CarState {
   pits: number;
   /** lap on which the AI plans its stop */
   pitLap: number;
+  /** seconds left in a crash (human car only) */
+  crashT: number;
+  overT: number;
 }
+
+export const CRASH_TIME = 2.2;
 
 /** pace multiplier from tyre age: gentle drop, then a cliff after ~4 laps */
 export function tyreGrip(age: number): number {
@@ -101,6 +106,14 @@ export class RaceSim {
   events: string[] = [];
   /** the car the viewer manages (-1 = none): the AI never pits it */
   playerCar = -1;
+  /** human throttle 0..1 (pinch held = 1) */
+  throttle = 0;
+  /** true when the human drives playerCar (slot-car style) */
+  humanDrives = false;
+  /** demo/bot driver for the player's car (?autodrive): lifts just before corners */
+  autoDrive = false;
+  crashes = 0;
+  onCrash?: (car: CarState) => void;
   private rand: () => number;
   private readonly vmax = 0.24;
   private readonly cornerK = 0.045;
@@ -131,6 +144,8 @@ export class RaceSim {
       pitting: 0,
       pits: 0,
       pitLap: 3,
+      crashT: 0,
+      overT: 0,
     }));
     this.order = this.cars.slice();
     this.reset(seed);
@@ -163,9 +178,14 @@ export class RaceSim {
       c.push = false;
       c.pitting = 0;
       c.pits = 0;
+      c.crashT = 0;
+      c.overT = 0;
       c.pitLap = Math.max(2, Math.round(this.totalLaps * (0.38 + this.rand() * 0.22)));
     });
     this.playerCar = -1;
+    this.humanDrives = false;
+    this.throttle = 0;
+    this.crashes = 0;
     this.sortOrder();
   }
 
@@ -190,6 +210,19 @@ export class RaceSim {
     const L = this.track.length;
     const d = ((dist % L) + L) % L;
     return Math.min(this.track.points.length - 1, Math.floor((d / L) * (this.track.points.length - 1)));
+  }
+
+  /** simple lookahead bot: keep the gas on unless a corner ahead needs braking now */
+  private botThrottle(car: CarState, grip: number): boolean {
+    const n = this.track.points.length - 1;
+    const ds = this.track.length / n;
+    const v = car.speed;
+    for (let j = 0; j < 80; j++) {
+      const k = this.track.curvature[this.sampleIndex(car.dist + j * ds)];
+      const lim = ((this.vmax * car.driver.skill * grip) / (1 + this.cornerK * k)) * 1.17;
+      if (v > lim && (v * v - lim * lim) / (2 * 0.95) >= j * ds - 0.004) return false;
+    }
+    return true;
   }
 
   step(dt: number) {
@@ -233,6 +266,36 @@ export class RaceSim {
           if (gap < 0.03) wantLateral = ahead.lateral > 0 ? -0.011 : 0.011;
         }
       }
+      if (this.humanDrives && car.index === this.playerCar) {
+        // slot-car: the player only controls speed; too fast in a corner = off you go
+        if (car.crashT > 0) {
+          car.crashT -= dt;
+          car.speed = 0;
+          if (car.crashT <= 0) car.crashT = 0;
+          continue;
+        }
+        const limit = (this.vmax * car.driver.skill * grip) / (1 + this.cornerK * k);
+        if (this.autoDrive) this.throttle = this.botThrottle(car, grip) ? 1 : 0;
+        target = this.throttle > 0.5 ? this.vmax * 1.04 * grip : 0;
+        if (car.speed > limit * 1.25) car.overT += dt;
+        else car.overT = Math.max(0, car.overT - dt * 2);
+        if (car.overT > 0.1) {
+          car.overT = 0;
+          car.crashT = CRASH_TIME;
+          this.crashes++;
+          this.pushEvent('YOU CRASHED! Lift earlier...');
+          this.onCrash?.(car);
+          car.speed = 0;
+          continue;
+        }
+        const acc = target > car.speed ? 0.24 : 0.95;
+        car.speed += Math.sign(target - car.speed) * Math.min(Math.abs(target - car.speed), acc * dt);
+        car.lateral += (wantLateral - car.lateral) * Math.min(1, dt * 3);
+        const b0 = car.dist;
+        car.dist += car.speed * dt;
+        this.lapCheck(car, b0);
+        continue;
+      }
       if (car.pitting > 0) {
         // in the pit box: crawl along the pit lane edge, then fresh tyres
         target = 0.035;
@@ -251,27 +314,7 @@ export class RaceSim {
       car.lateral += (wantLateral - car.lateral) * Math.min(1, dt * 3);
       const before = car.dist;
       car.dist += car.speed * dt;
-      // lap completion
-      if (Math.floor(car.dist / L) > Math.floor(before / L) && car.dist > 0) {
-        const lapTime = this.time - car.lapStart;
-        if (car.lap > 0 || before >= 0) {
-          car.lastLap = lapTime;
-          if (lapTime < car.bestLap) car.bestLap = lapTime;
-          if (car.lap > 0 && lapTime < this.fastestLap) {
-            this.fastestLap = lapTime;
-            this.fastestLapCar = car.index;
-            this.pushEvent(`FASTEST LAP  ${car.driver.code}  ${formatTime(lapTime)}`);
-          }
-        }
-        car.lap += 1;
-        car.lapStart = this.time;
-        car.form = 1 + (this.rand() - 0.5) * 0.025;
-        if (car.lap >= this.totalLaps) {
-          car.finished = true;
-          car.finishTime = this.time;
-          if (this.order[0] === car) this.pushEvent(`${car.driver.code} WINS!`);
-        }
-      }
+      this.lapCheck(car, before);
     }
     const prev = this.order.map((c) => c.index);
     this.sortOrder();
@@ -283,7 +326,36 @@ export class RaceSim {
         if (passed && was === p + 1) this.pushEvent(`${c.driver.code} PASSES ${passed.driver.code} FOR P${p + 1}`);
       }
     }
+    // a struggling human never holds the race hostage: once every AI car is home, it's over
+    if (!allDone && this.humanDrives && this.playerCar >= 0)
+      allDone = this.cars.every((c) => c.finished || c.index === this.playerCar);
     if (allDone) this.phase = RacePhase.Finished;
+  }
+
+  private lapCheck(car: CarState, before: number) {
+    const L = this.track.length;
+    // lap completion
+    if (Math.floor(car.dist / L) > Math.floor(before / L) && car.dist > 0) {
+      const lapTime = this.time - car.lapStart;
+      if (car.lap > 0 || before >= 0) {
+        car.lastLap = lapTime;
+        if (lapTime < car.bestLap) car.bestLap = lapTime;
+        if (car.lap > 0 && lapTime < this.fastestLap) {
+          this.fastestLap = lapTime;
+          this.fastestLapCar = car.index;
+          this.pushEvent(`FASTEST LAP  ${car.driver.code}  ${formatTime(lapTime)}`);
+        }
+      }
+      car.lap += 1;
+      car.lapStart = this.time;
+      car.form = 1 + (this.rand() - 0.5) * 0.025;
+      if (car.lap >= this.totalLaps) {
+        car.finished = true;
+        car.finishTime = this.time;
+        if (this.order[0] === car) this.pushEvent(`${car.driver.code} WINS!`);
+      }
+    }
+
   }
 
   /** send a car to the pits (ignored if already pitting or not racing) */

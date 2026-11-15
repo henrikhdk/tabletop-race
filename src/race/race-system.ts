@@ -30,7 +30,7 @@ import { hexToRgb, MeshBuilder } from './mesh-builder.js';
 
 const TRAIL_SEGMENTS = 24;
 import { CarMarker, RaceBoard, UiButton } from './race-components.js';
-import { CarState, formatTime, RacePhase, RaceSim, TEAMS, tyreLife } from './race-sim.js';
+import { CarState, CRASH_TIME, formatTime, RacePhase, RaceSim, TEAMS, tyreLife } from './race-sim.js';
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
 import { RaceAudio } from './race-audio.js';
 import { HandPlay } from './hand-play.js';
@@ -120,6 +120,10 @@ export class RaceSystem extends createSystem({
   private lastDelta = 1 / 72;
   private clock = 0;
   private lastLit = 0;
+  // --- slot-car driving: pinch held = gas ---
+  private pinchHeld = [false, false];
+  private keyGas = false;
+  private crashLanded: boolean[] = [];
 
   private leaderboard!: CanvasPanel;
   private controls!: CanvasPanel;
@@ -169,6 +173,21 @@ export class RaceSystem extends createSystem({
     this.queries.boards.subscribe('qualify', (e) => this.setupBoard(e));
     for (const e of this.queries.boards.entities) this.setupBoard(e);
 
+    const down = (e: KeyboardEvent) => {
+      if (e.code === 'Space') {
+        this.keyGas = true;
+        e.preventDefault();
+      }
+    };
+    const up = (e: KeyboardEvent) => {
+      if (e.code === 'Space') this.keyGas = false;
+    };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    this.cleanupFuncs.push(() => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+    });
     this.cleanupFuncs.push(
       this.queries.carPressed.subscribe('qualify', (e) => {
         this.onCarPinched(e.getValue(CarMarker, 'index') ?? 0);
@@ -366,8 +385,17 @@ export class RaceSystem extends createSystem({
     if (pickCar) {
       this.prediction = pickCar.index;
       this.sim.playerCar = pickCar.index;
+      this.sim.humanDrives = true;
       this.followed = pickCar.index;
     }
+    this.sim.autoDrive = q.has('autodrive');
+    this.sim.onCrash = (car) => {
+      const r = this.carRoots[car.index];
+      this.hand?.burst(r.position.x, r.position.y, r.position.z, 1);
+      this.audio.thud(1);
+      this.crashLanded[car.index] = false;
+      this.drawControls();
+    };
     if (q.has('autostart')) this.autostartPending = Math.max(1, Math.min(8, Number(q.get('speed')) || 1));
     this.setupIntro(boardEntity);
     this.startIntro();
@@ -381,10 +409,13 @@ export class RaceSystem extends createSystem({
   private onCarPinched(index: number) {
     if (!this.sim) return;
     this.audio.unlock();
+    // while you drive, every pinch is the gas pedal: never switch cars mid-race
+    if (this.sim.humanDrives && this.sim.phase !== RacePhase.Grid && this.sim.phase !== RacePhase.Finished) return;
     this.audio.beep(this.sim.phase === RacePhase.Grid ? 880 : 660, 0.12, 0.12);
     if (this.sim.phase === RacePhase.Grid) {
       this.prediction = index;
       this.sim.playerCar = index;
+      this.sim.humanDrives = true;
     }
     this.followed = index;
     this.onboardOn = true;
@@ -394,6 +425,8 @@ export class RaceSystem extends createSystem({
   private onButton(action: string) {
     if (!this.sim) return;
     this.audio.unlock();
+    // driving: a pinch aimed at the panel is the throttle, not a button press
+    if (this.sim.humanDrives && (this.sim.phase === RacePhase.Racing || this.sim.phase === RacePhase.Lights)) return;
     this.audio.click();
     switch (action) {
       case 'start':
@@ -462,6 +495,7 @@ export class RaceSystem extends createSystem({
     if (this.world.visibilityState.peek() === VisibilityState.VisibleBlurred) return;
     const dt = Math.min(delta, 0.05);
     const prevPhase = this.sim.phase;
+    if (!this.sim.autoDrive) this.sim.throttle = this.readGas() ? 1 : 0;
     // sub-step so fast-forward stays stable
     const steps = Math.max(1, Math.ceil(this.timeScale));
     for (let i = 0; i < steps; i++) this.sim.step((dt * this.timeScale) / steps);
@@ -524,6 +558,7 @@ export class RaceSystem extends createSystem({
       root.position.copy(this.tmpPos);
       // orientation in board space (the board itself may be moved/rotated)
       root.rotation.set(0, Math.atan2(tan.x + this.track.tangents[i1].x, tan.z + this.track.tangents[i1].z), 0);
+      if (car.crashT > 0) this.applyCrash(car, root, tan);
       this.carRings[car.index].visible = car.index === this.followed;
     }
     this.updateTrails();
@@ -539,6 +574,71 @@ export class RaceSystem extends createSystem({
     } else {
       this.pickMarker.visible = false;
     }
+  }
+
+  /** off-track excursion: fly straight on, tumble, sit in the gravel, roll back */
+  private applyCrash(car: CarState, root: Group, tan: Vector3) {
+    const u = 1 - car.crashT / CRASH_TIME;
+    const FLY = 0.3;
+    const out = 0.075;
+    let m: number;
+    let y = 0;
+    if (u < FLY) {
+      const a = u / FLY;
+      m = easeOutCubic(a) * out;
+      y = Math.sin(a * Math.PI) * 0.035;
+      root.rotation.y += a * a * 9;
+      root.rotation.z = Math.sin(a * Math.PI) * 1.4;
+    } else if (u < 0.8) {
+      m = out;
+      root.rotation.y += 9 + Math.sin((u - FLY) * 30) * 0.05 * (0.8 - u);
+      if (!this.crashLanded[car.index]) {
+        this.crashLanded[car.index] = true;
+        this.tmpLook.copy(root.position).addScaledVector(tan, out);
+        this.hand?.burst(this.tmpLook.x, this.tmpLook.y, this.tmpLook.z, 0.7);
+        this.audio.thud(0.7);
+      }
+    } else {
+      const a = easeInOut((u - 0.8) / 0.2);
+      m = out * (1 - a);
+      root.rotation.y += 9 * (1 - a) + (2 * Math.PI) * Math.round(9 / (2 * Math.PI)) * a;
+    }
+    root.position.addScaledVector(tan, m);
+    root.position.y += y;
+  }
+
+  /** gas pedal: thumb-index pinch on either hand (or trigger), Space / mouse on desktop */
+  private readGas(): boolean {
+    let gas = this.keyGas;
+    const frame = this.world.xrFrame;
+    const ref = this.world.xrReferenceSpace;
+    const session = this.world.session;
+    if (frame && ref && session) {
+      let k = 0;
+      for (const src of session.inputSources) {
+        if (k > 1) break;
+        const hand = src.hand;
+        const thumb = hand?.get('thumb-tip');
+        const index = hand?.get('index-finger-tip');
+        if (hand && thumb && index && frame.getJointPose) {
+          const a = frame.getJointPose(thumb, ref);
+          const b = frame.getJointPose(index, ref);
+          if (a && b) {
+            const dx = a.transform.position.x - b.transform.position.x;
+            const dy = a.transform.position.y - b.transform.position.y;
+            const dz = a.transform.position.z - b.transform.position.z;
+            const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            // hysteresis so a shaky pinch does not stutter the throttle
+            this.pinchHeld[k] = this.pinchHeld[k] ? d < 0.035 : d < 0.02;
+          } else this.pinchHeld[k] = false;
+        } else {
+          this.pinchHeld[k] = !!src.gamepad?.buttons[0]?.pressed;
+        }
+        gas = gas || this.pinchHeld[k];
+        k++;
+      }
+    }
+    return gas;
   }
 
   private setupIntro(boardEntity: Entity) {
@@ -855,6 +955,17 @@ export class RaceSystem extends createSystem({
   }
 
   private onRaceFinished() {
+    if (this.sim.humanDrives && this.prediction >= 0) {
+      const me = this.sim.cars[this.prediction];
+      const pts = scorePrediction(me.position, false).points;
+      const crash = this.sim.crashes === 0 ? 'clean race!' : `${this.sim.crashes} crash${this.sim.crashes > 1 ? 'es' : ''}`;
+      this.lastScore = { points: pts, text: me.position === 1 ? `YOU WON! ${crash}` : `You finished P${me.position}, ${crash}` };
+      this.profile.points += pts;
+      this.profile.races += 1;
+      if (me.position === 1) this.profile.wins += 1;
+      saveProfile(this.profile);
+      return;
+    }
     if (this.prediction < 0) {
       this.lastScore = { points: 0, text: 'No prediction this race' };
       return;
@@ -948,9 +1059,17 @@ export class RaceSystem extends createSystem({
     if (this.sim.phase === RacePhase.Grid)
       hint =
         this.prediction < 0
-          ? 'Pinch a car to call the WINNER, then START'
-          : `Your pick: ${this.sim.cars[this.prediction].driver.code}  ·  press START`;
-    else if (this.sim.phase === RacePhase.Lights) hint = 'Lights...';
+          ? 'Pinch a car to DRIVE it, then START'
+          : `You drive ${this.sim.cars[this.prediction].driver.code}  ·  press START`;
+    else if (this.sim.phase === RacePhase.Lights)
+      hint = this.sim.humanDrives ? 'Get ready... PINCH & HOLD = GAS' : 'Lights...';
+    else if (this.sim.phase === RacePhase.Racing && this.sim.humanDrives && this.prediction >= 0) {
+      const me = this.sim.cars[this.prediction];
+      hint =
+        me.crashT > 0
+          ? 'OFF! Lift BEFORE the corner...'
+          : `P${me.position}  ·  PINCH & HOLD = GAS  ·  LET GO = BRAKE`;
+    }
     else if (this.sim.phase === RacePhase.Racing)
       hint =
         this.timeScale === 0

@@ -233,7 +233,7 @@ export class HandPlay {
     this.updateSparks(dt);
   }
 
-  private burst(x: number, y: number, z: number, strength: number) {
+  burst(x: number, y: number, z: number, strength: number) {
     const n = Math.floor(14 + strength * 26);
     for (let k = 0; k < n; k++) {
       const i = this.sparkNext;
