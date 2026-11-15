@@ -19,8 +19,19 @@ jobs:
         with:
           node-version: 22
           cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            foodtruck/package-lock.json
       - run: npm ci
       - run: npm run build
+        env:
+          NODE_ENV: production
+      # Food Truck Racing variant: separate copy, published at /foodtruck/.
+      # If it fails to build, the main app still deploys.
+      - name: Build foodtruck variant
+        continue-on-error: true
+        working-directory: foodtruck
+        run: npm ci && npm run build && rm -rf ../dist/foodtruck && cp -r dist ../dist/foodtruck
         env:
           NODE_ENV: production
       - uses: actions/upload-pages-artifact@v3

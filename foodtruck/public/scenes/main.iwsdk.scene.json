@@ -1,0 +1,124 @@
+{
+  "version": "iwsdk.scene.v1",
+  "units": "meters",
+  "components": {
+    "com.iwsdk.components.IBLGradient": {
+      "sky": [
+        0.85,
+        0.9,
+        1,
+        1
+      ],
+      "equator": [
+        0.6,
+        0.65,
+        0.75,
+        1
+      ],
+      "ground": [
+        0.3,
+        0.3,
+        0.35,
+        1
+      ],
+      "intensity": 0.6
+    }
+  },
+  "environment": {
+    "toneMapping": "aces",
+    "exposure": 1,
+    "shadows": false
+  },
+  "resources": {},
+  "nodes": [
+    {
+      "id": "race-board",
+      "name": "Race Board",
+      "content": {
+        "type": "asset",
+        "asset": "race-board"
+      },
+      "transform": {
+        "position": [
+          0,
+          0.72,
+          -0.62
+        ]
+      },
+      "components": {
+        "RaceBoard": {
+          "laps": 8
+        }
+      }
+    },
+    {
+      "id": "key-light",
+      "name": "Key Light",
+      "transform": {
+        "position": [
+          -1.5,
+          4,
+          1.5
+        ],
+        "rotationDeg": [
+          -60,
+          -20,
+          0
+        ]
+      },
+      "components": {
+        "DirectionalLight": {
+          "color": [
+            1,
+            0.96,
+            0.9,
+            1
+          ],
+          "intensity": 1.6,
+          "castShadow": false
+        }
+      }
+    },
+    {
+      "id": "fill-light",
+      "name": "Fill Light",
+      "components": {
+        "HemisphereLight": {
+          "skyColor": [
+            0.9,
+            0.95,
+            1,
+            1
+          ],
+          "groundColor": [
+            0.4,
+            0.4,
+            0.45,
+            1
+          ],
+          "intensity": 1.1
+        }
+      }
+    }
+  ],
+  "authoring": {
+    "views": [
+      {
+        "id": "hero",
+        "role": "hero",
+        "projection": "perspective",
+        "position": [
+          0,
+          1.17,
+          0.02
+        ],
+        "target": [
+          0,
+          0.72,
+          -0.66
+        ],
+        "fov": 60
+      }
+    ]
+  }
+}
