@@ -26,6 +26,7 @@ import { MeshBuilder } from './mesh-builder.js';
 import { CarMarker, RaceBoard, UiButton } from './race-components.js';
 import { CarState, formatTime, RacePhase, RaceSim, TEAMS } from './race-sim.js';
 import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
+import { RaceAudio } from './race-audio.js';
 import { loadProfile, Profile, saveProfile, scorePrediction } from './profile.js';
 
 const BUTTONS = [
@@ -94,6 +95,8 @@ export class RaceSystem extends createSystem({
   private followed = -1;
   private lastScore: { points: number; text: string } | null = null;
   private onboardOn = true;
+  private audio = new RaceAudio();
+  private lastLit = 0;
 
   private leaderboard!: CanvasPanel;
   private controls!: CanvasPanel;
@@ -265,6 +268,8 @@ export class RaceSystem extends createSystem({
   // ---------------------------------------------------------------------
   private onCarPinched(index: number) {
     if (!this.sim) return;
+    this.audio.unlock();
+    this.audio.beep(this.sim.phase === RacePhase.Grid ? 880 : 660, 0.12, 0.12);
     if (this.sim.phase === RacePhase.Grid) {
       this.prediction = index;
     }
@@ -275,6 +280,8 @@ export class RaceSystem extends createSystem({
 
   private onButton(action: string) {
     if (!this.sim) return;
+    this.audio.unlock();
+    this.audio.click();
     switch (action) {
       case 'start':
         if (this.sim.phase === RacePhase.Grid) this.sim.startLights();
@@ -338,6 +345,14 @@ export class RaceSystem extends createSystem({
     this.placeCars();
     const lit = this.sim.lightsOn;
     for (let i = 0; i < 5; i++) this.lights[i].material = i < lit ? this.lightOn : this.lightOff;
+    if (lit !== this.lastLit) {
+      if (lit > this.lastLit) this.audio.beep(440, 0.25, 0.2);
+      this.lastLit = lit;
+    }
+    if (prevPhase === RacePhase.Lights && this.sim.phase === RacePhase.Racing) this.audio.beep(880, 0.5, 0.25);
+    const fc = this.followed >= 0 ? this.sim.cars[this.followed] : undefined;
+    const racing = this.sim.phase === RacePhase.Racing && this.timeScale > 0;
+    this.audio.engine(fc ? Math.min(1, fc.speed / 0.24) : 0, racing ? 1 : 0);
 
     this.uiTimer += delta;
     if (this.uiTimer > 0.25) {
