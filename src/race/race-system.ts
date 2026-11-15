@@ -427,7 +427,7 @@ export class RaceSystem extends createSystem({
     if (prevPhase === RacePhase.Lights && this.sim.phase === RacePhase.Racing) this.audio.beep(880, 0.5, 0.25);
     const fc = this.followed >= 0 ? this.sim.cars[this.followed] : undefined;
     const racing = this.sim.phase === RacePhase.Racing && this.timeScale > 0;
-    this.audio.engine(fc ? Math.min(1, fc.speed / 0.24) : 0, racing ? 1 : 0);
+    this.audio.engine(fc ? Math.min(1, fc.speed / 0.24) : 0, racing ? 1 : 0, Math.max(1e-3, delta * this.timeScale));
     if (fc && racing) {
       const head = this.player.head;
       head.updateWorldMatrix(true, false);

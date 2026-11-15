@@ -1,9 +1,9 @@
+import { EngineSynth } from './engine-synth.js';
+
 /** Tiny procedural sound: start-light beeps, a crowd/engine bed that follows race pace, UI clicks. */
 export class RaceAudio {
   private ctx?: AudioContext;
-  private engineGain?: GainNode;
-  private engineOsc?: OscillatorNode;
-  private engineOsc2?: OscillatorNode;
+  private engineSynth?: EngineSynth;
   private panner?: PannerNode;
 
   private ensure() {
@@ -12,33 +12,17 @@ export class RaceAudio {
       const ctx = new AudioContext();
       this.ctx = ctx;
       const g = ctx.createGain();
-      g.gain.value = 0;
-      const filter = ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.value = 900;
-      const o1 = ctx.createOscillator();
-      o1.type = 'sawtooth';
-      o1.frequency.value = 110;
-      const o2 = ctx.createOscillator();
-      o2.type = 'square';
-      o2.frequency.value = 165;
-      const g2 = ctx.createGain();
-      g2.gain.value = 0.35;
-      o1.connect(filter);
-      o2.connect(g2).connect(filter);
+      g.gain.value = 0.32;
+      this.engineSynth = new EngineSynth(ctx);
       // HRTF panner: the engine note comes from the followed car's real position
       const panner = ctx.createPanner();
       panner.panningModel = 'HRTF';
       panner.distanceModel = 'inverse';
       panner.refDistance = 0.25;
       panner.rolloffFactor = 1.2;
-      filter.connect(panner).connect(g).connect(ctx.destination);
+      this.engineSynth.output.connect(panner).connect(g).connect(ctx.destination);
       this.panner = panner;
-      o1.start();
-      o2.start();
-      this.engineGain = g;
-      this.engineOsc = o1;
-      this.engineOsc2 = o2;
+
     } catch {
       /* no audio */
     }
@@ -166,12 +150,8 @@ export class RaceAudio {
   }
 
   /** pace 0..1 (follow-car speed / max), volume 0..1 */
-  engine(pace: number, volume: number) {
-    if (!this.ctx || !this.engineGain || !this.engineOsc || !this.engineOsc2) return;
-    const t = this.ctx.currentTime;
-    const f = 70 + pace * 190;
-    this.engineOsc.frequency.setTargetAtTime(f, t, 0.08);
-    this.engineOsc2.frequency.setTargetAtTime(f * 1.5, t, 0.08);
-    this.engineGain.gain.setTargetAtTime(volume * 0.12, t, 0.2);
+  engine(pace: number, volume: number, dt = 1 / 72) {
+    this.engineSynth?.update(pace, volume, dt);
   }
+
 }
