@@ -121,6 +121,10 @@ export class RaceSystem extends createSystem({
 
   private uiTimer = 0;
   private frame = 0;
+  private fpsPanel?: CanvasPanel;
+  private fpsFrames = 0;
+  private fpsTime = 0;
+  private fpsWorst = 0;
   private hoveredAction = '';
   private tmpPos = new Vector3();
   private tmpLook = new Vector3();
@@ -291,6 +295,13 @@ export class RaceSystem extends createSystem({
     this.world.createTransformEntity(this.pipFrame, pipEntity);
 
     this.followed = this.sim.order[0].index;
+    // ?fps : small performance HUD next to the timing tower
+    if (new URLSearchParams(location.search).has('fps')) {
+      this.fpsPanel = new CanvasPanel(400, 150, 0.12, 'fps-hud');
+      this.fpsPanel.mesh.position.set(-0.36, 0.05, 0.38);
+      this.fpsPanel.mesh.rotation.set(-0.9, 0.25, 0, 'YXZ');
+      this.world.createTransformEntity(this.fpsPanel.mesh, boardEntity);
+    }
     // ?autostart&speed=4 : start immediately (handy for demo capture on desktop)
     const q = new URLSearchParams(location.search);
     if (q.has('autostart')) {
@@ -400,6 +411,7 @@ export class RaceSystem extends createSystem({
       this.drawPip();
     }
     this.frame++;
+    if (this.fpsPanel) this.updateFps(delta);
     if (this.onboardOn && this.followed >= 0 && (this.frame & 1) === 0) this.renderOnboard();
   }
 
@@ -556,6 +568,31 @@ export class RaceSystem extends createSystem({
       (tr.geo.getAttribute('position') as BufferAttribute).needsUpdate = true;
       (tr.geo.getAttribute('color') as BufferAttribute).needsUpdate = true;
     }
+  }
+
+  private updateFps(delta: number) {
+    this.fpsFrames++;
+    this.fpsTime += delta;
+    this.fpsWorst = Math.max(this.fpsWorst, delta);
+    if (this.fpsTime < 0.5 || !this.fpsPanel) return;
+    const fps = this.fpsFrames / this.fpsTime;
+    const p = this.fpsPanel;
+    const ctx = p.ctx;
+    const info = this.world.renderer.info.render;
+    p.background(0.85);
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.font = '800 56px system-ui, sans-serif';
+    ctx.fillStyle = fps >= 70 ? '#3dff8b' : fps >= 60 ? '#ffe14d' : '#ff3b5c';
+    ctx.fillText(`${fps.toFixed(0)} FPS`, 24, 52);
+    ctx.font = '600 24px system-ui, sans-serif';
+    ctx.fillStyle = '#cfe0f0';
+    ctx.fillText(`avg ${((this.fpsTime / this.fpsFrames) * 1000).toFixed(1)} ms  worst ${(this.fpsWorst * 1000).toFixed(1)} ms`, 24, 100);
+    ctx.fillText(`draws ${info.calls}  tris ${(info.triangles / 1000).toFixed(0)}k`, 24, 128);
+    p.commit();
+    this.fpsFrames = 0;
+    this.fpsTime = 0;
+    this.fpsWorst = 0;
   }
 
   private renderOnboard() {
