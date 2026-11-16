@@ -120,6 +120,11 @@ export class RaceSim {
   /** assisted driving runs a touch under the limit: cooking (abilities) is what wins races */
   assistPace = 0.92;
   crashes = 0;
+  // --- kitchen abilities on the player's truck (seconds left) ---
+  boostT = 0;
+  gripT = 0;
+  guardT = 0;
+  hiccupT = 0;
   onCrash?: (car: CarState) => void;
   private rand: () => number;
   private readonly vmax = 0.24;
@@ -200,7 +205,26 @@ export class RaceSim {
     this.humanDrives = false;
     this.throttle = 0;
     this.crashes = 0;
+    this.boostT = this.gripT = this.guardT = this.hiccupT = 0;
     this.sortOrder();
+  }
+
+  private gripBoost() {
+    return this.gripT > 0 ? 1.4 : 1;
+  }
+
+  /** fire a served dish: pepper = turbo, cheese = grip, filling = block */
+  activate(d: { pepper: number; cheese: number; filling: number }) {
+    if (d.pepper > 0) {
+      this.boostT = Math.max(this.boostT, 1.8 + d.pepper * 1.1);
+      // three doses is too spicy: a short hiccup before the turbo kicks in
+      if (d.pepper >= 3) {
+        this.hiccupT = 0.7;
+        this.boostT += 0.7;
+      }
+    }
+    if (d.cheese > 0) this.gripT = Math.max(this.gripT, 3 + d.cheese * 2.5);
+    if (d.filling > 0) this.guardT = Math.max(this.guardT, 3 + d.filling * 2);
   }
 
   startLights() {
@@ -233,7 +257,7 @@ export class RaceSim {
     const v = car.speed;
     for (let j = 0; j < 80; j++) {
       const k = this.track.curvature[this.sampleIndex(car.dist + j * ds)];
-      const lim = ((this.vmax * car.driver.skill * grip * this.playerGrip) / (1 + this.cornerK * k)) * 1.17 * this.assistPace;
+      const lim = ((this.vmax * car.driver.skill * grip * this.playerGrip * this.gripBoost()) / (1 + this.cornerK * k)) * 1.17 * this.assistPace;
       if (v > lim && (v * v - lim * lim) / (2 * 0.95) >= j * ds - 0.004) return false;
     }
     return true;
@@ -250,6 +274,10 @@ export class RaceSim {
       return;
     }
     this.time += dt;
+    this.boostT = Math.max(0, this.boostT - dt);
+    this.gripT = Math.max(0, this.gripT - dt);
+    this.guardT = Math.max(0, this.guardT - dt);
+    this.hiccupT = Math.max(0, this.hiccupT - dt);
     const L = this.track.length;
     let allDone = true;
     for (const car of this.order) {
@@ -279,6 +307,11 @@ export class RaceSim {
           else target *= 1.04; // slipstream
           if (gap < 0.03) wantLateral = ahead.lateral > 0 ? -0.011 : 0.011;
         }
+        // BLOCK (filling): the player's heavy truck can't be passed
+        if (this.guardT > 0 && ahead.index === this.playerCar && gap < 0.07) {
+          target = Math.min(target, ahead.speed * 0.98);
+          wantLateral = ahead.lateral;
+        }
       }
       if (this.humanDrives && car.index === this.playerCar) {
         // slot-car: the player only controls speed; too fast in a corner = off you go
@@ -288,9 +321,12 @@ export class RaceSim {
           if (car.crashT <= 0) car.crashT = 0;
           continue;
         }
-        const limit = (this.vmax * car.driver.skill * grip * this.playerGrip) / (1 + this.cornerK * k);
+        const limit = (this.vmax * car.driver.skill * grip * this.playerGrip * this.gripBoost()) / (1 + this.cornerK * k);
         if (this.autoDrive) this.throttle = this.botThrottle(car, grip) ? 1 : 0;
         target = this.throttle > 0.5 ? this.vmax * 1.04 * grip * this.playerTop * (this.autoDrive ? this.assistPace : 1) : 0;
+        // TURBO (pepper): faster everywhere, the bot also corners harder; a hiccup first if over-spiced
+        if (this.hiccupT > 0) target *= 0.45;
+        else if (this.boostT > 0 && this.throttle > 0.5) target = this.vmax * 1.32 * this.playerTop;
         if (car.speed > limit * 1.25) car.overT += dt;
         else car.overT = Math.max(0, car.overT - dt * 2);
         if (car.overT > 0.1) {
@@ -302,7 +338,7 @@ export class RaceSim {
           car.speed = 0;
           continue;
         }
-        const acc = target > car.speed ? 0.24 * this.playerAccel : 0.95;
+        const acc = target > car.speed ? 0.24 * this.playerAccel * (this.boostT > 0 ? 2.2 : 1) : 0.95;
         car.speed += Math.sign(target - car.speed) * Math.min(Math.abs(target - car.speed), acc * dt);
         car.lateral += (wantLateral - car.lateral) * Math.min(1, dt * 3);
         const b0 = car.dist;

@@ -39,6 +39,7 @@ import { createRaceBoard } from '../scene-assets/race-board.scene-asset.js';
 import { RaceAudio } from './race-audio.js';
 import { HandPlay } from './hand-play.js';
 import { PalmUpDetector } from './palm-menu.js';
+import { dishLabel, Kitchen } from './kitchen.js';
 import { Build, buildStats, SLOT_NAMES, SLOTS, TruckModel } from './food-truck.js';
 
 const PLAYER = 6; // grid slot P7: you start mid-pack
@@ -195,6 +196,13 @@ export class RaceSystem extends createSystem({
   private menuOpen = false;
   private menuPrevScale = 1;
   private palmUp!: PalmUpDetector;
+  // --- cooking bench ---
+  private kitchen?: Kitchen;
+  /** seconds on the grid waiting for the tutorial dish (-1 = not waiting) */
+  private gridT = -1;
+  private gridServedT = -1;
+  private exhaustT = 0;
+  private abilityHint = 0;
   private headPos = new Vector3();
   private headFwd = new Vector3();
 
@@ -411,6 +419,7 @@ export class RaceSystem extends createSystem({
     this.setupResults(boardEntity, btnMat);
     this.setupMenu(btnMat);
     this.setupLobby(btnMat);
+    this.setupKitchen(boardEntity, btnMat);
 
     // ---- strategy panel: manage your driver (left of the controls) ------
     this.strategy = new CanvasPanel(640, 240, 0.27, 'strategy');
@@ -539,6 +548,10 @@ export class RaceSystem extends createSystem({
       else this.backToGarage();
       return;
     }
+    if (action === 'ability') {
+      this.onAbility();
+      return;
+    }
     if (action.startsWith('lobby:')) {
       if (this.mode !== 'lobby') return;
       this.onLobby(action);
@@ -563,7 +576,7 @@ export class RaceSystem extends createSystem({
     switch (action) {
       case 'start':
         if (this.sim.phase === RacePhase.Grid) {
-          if (this.mode === 'race') this.sim.startLights();
+          if (this.mode === 'race') this.goLights();
         } else if (this.timeScale === 0) this.timeScale = 1;
         else if (this.sim.phase === RacePhase.Racing) this.timeScale = 0;
         break;
@@ -634,12 +647,13 @@ export class RaceSystem extends createSystem({
     if (prevPhase !== this.sim.phase) this.drawControls();
     this.updateResults(delta);
     this.updateLobby();
+    this.updateKitchen(delta);
     if (import.meta.env.DEV) {
       this.dbgT += delta;
       if (this.dbgT > 5) {
         this.dbgT = 0;
         const me = this.sim.cars[PLAYER];
-        console.info(`[flow] mode=${this.mode} phase=${this.sim.phase} lap=${me.lap}/${this.sim.totalLaps} pos=${me.position} t=${this.sim.time.toFixed(1)} fps=${(1 / Math.max(delta, 1e-3)).toFixed(0)} results=${this.resultsT.toFixed(1)} menu=${this.menuOpen}`);
+        console.info(`[flow] mode=${this.mode} phase=${this.sim.phase} lap=${me.lap}/${this.sim.totalLaps} pos=${me.position} t=${this.sim.time.toFixed(1)} fps=${(1 / Math.max(delta, 1e-3)).toFixed(0)} results=${this.resultsT.toFixed(1)} menu=${this.menuOpen} doses=${this.kitchen?.doses} served=${this.kitchen?.served} loaded=${this.kitchen?.loaded ? dishLabel(this.kitchen.loaded) : '-'} boost=${this.sim.boostT.toFixed(1)}`);
       }
     }
     {
@@ -858,7 +872,7 @@ export class RaceSystem extends createSystem({
         this.audio.thud(1);
         this.hand?.burst(target.position.x, target.position.y, target.position.z, 0.6, true);
         this.controls.mesh.scale.setScalar(1);
-        this.sim.startLights();
+        this.beginGridRecipe();
         this.drawControls();
       }
     }
@@ -955,6 +969,9 @@ export class RaceSystem extends createSystem({
     this.resultsT = -1;
     this.finishGrace = -1;
     this.results.mesh.scale.setScalar(0.0001);
+    this.gridT = -1;
+    this.gridServedT = -1;
+    this.kitchen?.reset();
   }
 
   /** same truck, straight back onto the grid */
@@ -1335,6 +1352,96 @@ export class RaceSystem extends createSystem({
     ctx.fill();
   }
 
+  // ---------------------------------------------------------------------
+  // cooking bench: dough -> plate -> ingredient -> hatch -> ability button
+
+  private setupKitchen(boardEntity: Entity, btnMat: MeshBasicMaterial) {
+    const k = new Kitchen(this.world, boardEntity, this.audio, btnMat);
+    k.canServe = () => (this.mode === 'race' || this.mode === 'deliver') && this.sim.phase !== RacePhase.Finished;
+    k.onDose = (_kind, world) => {
+      const b = this.board?.object3D;
+      if (!b) return;
+      this.tmpA.copy(world);
+      b.worldToLocal(this.tmpA);
+      this.hand?.burst(this.tmpA.x, this.tmpA.y + 0.02, this.tmpA.z, 0.25, true);
+    };
+    k.onServe = () => {
+      if (this.gridT >= 0 && this.gridServedT < 0) this.gridServedT = 0;
+    };
+    k.onActivate = (d) => {
+      this.sim.activate(d);
+      this.audio.honk(1);
+      this.audio.swell(1.2);
+      const r = this.carRoots[PLAYER];
+      this.hand?.burst(r.position.x, r.position.y + 0.01, r.position.z, 0.8, true);
+      k.say(`${dishLabel(d)}!`, d.pepper ? 'Vapor de queijo out the exhaust…' : d.cheese ? 'Sticky like fondue in the corners' : 'Too heavy to pass. Hold the line!');
+    };
+    this.kitchen = k;
+  }
+
+  /** after the truck lands on the grid: the radio asks for the first dish before the lights */
+  private beginGridRecipe() {
+    this.gridT = 0;
+    this.gridServedT = -1;
+    this.kitchen?.say('Box box! One spicy dough ball, chef.', 'Dough → plate → hold PEPPER over it → hatch');
+  }
+
+  private goLights() {
+    if (this.sim.phase !== RacePhase.Grid) return;
+    this.gridT = -1;
+    this.gridServedT = -1;
+    this.sim.startLights();
+    this.kitchen?.say(this.kitchen.loaded ? 'Lights… then HIT THE BUTTON!' : 'Lights…', this.kitchen.loaded ? 'Turbo off the line' : 'You can cook on the move');
+  }
+
+  private onAbility() {
+    const k = this.kitchen;
+    if (!k || this.mode !== 'race') return;
+    this.audio.unlock();
+    if (this.sim.phase !== RacePhase.Racing) {
+      k.say('Hold it… wait for lights out!', '');
+      return;
+    }
+    if (k.press()) this.drawControls();
+  }
+
+  private updateKitchen(delta: number) {
+    const k = this.kitchen;
+    if (!k) return;
+    const show = this.mode === 'race' || this.mode === 'deliver';
+    k.setVisible(show);
+    if (!show) return;
+    k.update(delta);
+    // grid tutorial: start once the dish is served (or after a while)
+    if (this.gridT >= 0 && this.sim.phase === RacePhase.Grid && this.timeScale > 0) {
+      this.gridT += delta;
+      if (this.gridServedT >= 0) {
+        this.gridServedT += delta;
+        if (this.gridServedT > 1.4) this.goLights();
+      } else if (this.gridT > 35) {
+        k.say('No time! We go without it.', 'Cook during the race');
+        this.goLights();
+      }
+    }
+    // turbo: cheese steam out of the exhaust
+    if (this.sim.boostT > 0 && this.sim.phase === RacePhase.Racing && this.timeScale > 0) {
+      this.exhaustT += delta;
+      if (this.exhaustT > 0.12) {
+        this.exhaustT = 0;
+        const r = this.carRoots[PLAYER];
+        this.hand?.burst(r.position.x, r.position.y + 0.006, r.position.z, 0.18, true);
+      }
+    }
+    // nudge when a dish has been waiting a while
+    if (k.loaded && this.sim.phase === RacePhase.Racing) {
+      this.abilityHint += delta;
+      if (this.abilityHint > 9) {
+        this.abilityHint = 0;
+        k.say('Use it, chef!', 'Big button: chevrons ahead = turbo time');
+      }
+    } else this.abilityHint = 0;
+  }
+
   private drawGarage() {
     const G = this.garage;
     if (!G) return;
@@ -1652,6 +1759,7 @@ export class RaceSystem extends createSystem({
         this.startDeliver();
         this.deliverT = 9;
         this.updateGarage(0);
+        this.goLights();
         this.sim.lightsTime = 5;
         this.timeScale = this.autostartPending;
         this.autostartPending = 0;
@@ -1938,7 +2046,7 @@ export class RaceSystem extends createSystem({
     ctx.textAlign = 'left';
     let hint = '';
     if (this.sim.phase === RacePhase.Grid)
-      hint = this.mode === 'race' ? 'Pinch START when ready' : 'Build your truck first!';
+      hint = this.mode === 'race' ? 'Cook the radio\'s dish, or pinch START' : 'Build your truck first!';
     else if (this.sim.phase === RacePhase.Lights)
       hint = this.sim.humanDrives && !this.sim.autoDrive ? 'Get ready... PINCH & HOLD = GAS' : 'Lights...';
     else if (this.sim.phase === RacePhase.Racing && this.timeScale === 0) hint = 'Paused';
