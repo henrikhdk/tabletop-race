@@ -17,6 +17,7 @@ import {
   PerspectiveCamera,
   PlaneGeometry,
   Pressed,
+  Quaternion,
   RayInteractable,
   RingGeometry,
   SphereGeometry,
@@ -32,7 +33,9 @@ import { hexToRgb, MeshBuilder } from './mesh-builder.js';
 const TRAIL_SEGMENTS = 24;
 import { CarMarker, RaceBoard, UiButton } from './race-components.js';
 import { CarState, CRASH_TIME, formatTime, RacePhase, RaceSim, TEAMS, tyreLife } from './race-sim.js';
-import { sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
+import { createTrackCurve, sampleTrack, TrackSample, TRACK_SURFACE_Y } from './track.js';
+import { CircuitDef, circuitById, CIRCUITS } from './circuits.js';
+import { createRaceBoard } from '../scene-assets/race-board.scene-asset.js';
 import { RaceAudio } from './race-audio.js';
 import { HandPlay } from './hand-play.js';
 import { PalmUpDetector } from './palm-menu.js';
@@ -53,18 +56,27 @@ const READY_BUILD: Build = [0, 0, 2];
 const R_W = 1262;
 const R_H = 660;
 const R_BTNS = [
-  { id: 'results:again', label: 'RACE AGAIN', x: 70 },
-  { id: 'results:garage', label: 'GARAGE', x: 660 },
+  { id: 'results:again', label: 'RACE AGAIN', x: 50 },
+  { id: 'results:garage', label: 'GARAGE', x: 451 },
+  { id: 'results:lobby', label: 'CIRCUITS', x: 852 },
 ] as const;
-const R_BTN = { y: 510, w: 532, h: 120 };
+const R_BTN = { y: 510, w: 360, h: 120 };
+// lobby (paddock lounge) layout (canvas px)
+const L_W = 1400;
+const L_H = 820;
+const L_CARD = { x0: 40, y0: 150, w: 300, h: 196, gx: 20, gy: 20 };
+const L_GO = { x: 1000, y: 680, w: 360, h: 110 };
+/** asset meshes that make up one circuit's diorama (replaced when the circuit changes) */
+const BOARD_PARTS = ['water', 'island-fill', 'board-solid', 'trees', 'dome', 'board-glow'];
 const M_W = 900;
-const M_H = 760;
+const M_H = 800;
 const M_BTNS = [
-  { id: 'menu:resume', label: 'RESUME', y: 150 },
-  { id: 'menu:restart', label: 'RESTART RACE', y: 352 },
-  { id: 'menu:garage', label: 'GARAGE', y: 554 },
+  { id: 'menu:resume', label: 'RESUME', y: 140 },
+  { id: 'menu:restart', label: 'RESTART RACE', y: 300 },
+  { id: 'menu:garage', label: 'GARAGE', y: 460 },
+  { id: 'menu:lobby', label: 'CIRCUITS', y: 620 },
 ] as const;
-const M_BTN = { x: 60, w: 780, h: 170 };
+const M_BTN = { x: 60, w: 780, h: 140 };
 /** after you cross the line, the rest of the field gets this long to finish */
 const FINISH_GRACE = 4;
 /** podium returns to the garage by itself after this long */
@@ -160,7 +172,14 @@ export class RaceSystem extends createSystem({
   private keyGas = false;
   private crashLanded: boolean[] = [];
   // --- food truck garage ---
-  private mode: 'garage' | 'deliver' | 'race' = 'garage';
+  private mode: 'lobby' | 'garage' | 'deliver' | 'race' = 'lobby';
+  // --- circuits + lobby ---
+  private circuit: CircuitDef = CIRCUITS[0];
+  private lobby!: CanvasPanel;
+  private lobbySel = 0;
+  private introPending = false;
+  private tmpQ = new Quaternion();
+  private tilt = new Quaternion();
   private trucks: TruckModel[] = [];
   private garage!: { root: Group; spin: Group; truck: TruckModel; panel: CanvasPanel };
   private build: Build = [-1, -1, -1];
@@ -220,9 +239,12 @@ export class RaceSystem extends createSystem({
   private tmpLook = new Vector3();
   private tmpSide = new Vector3();
   private up = new Vector3(0, 1, 0);
+  private xAxis = new Vector3(1, 0, 0);
 
   init(): void {
-    this.track = sampleTrack();
+    this.circuit = circuitById(new URLSearchParams(location.search).get('circuit'));
+    this.lobbySel = CIRCUITS.indexOf(this.circuit);
+    this.track = sampleTrack(createTrackCurve(this.circuit));
     this.profile = loadProfile();
     this.queries.boards.subscribe('qualify', (e) => this.setupBoard(e));
     for (const e of this.queries.boards.entities) this.setupBoard(e);
@@ -259,6 +281,7 @@ export class RaceSystem extends createSystem({
         this.drawGarage();
         this.drawMenu();
         this.drawResults();
+        this.drawLobby();
       }),
       this.queries.buttonHovered.subscribe('disqualify', () => {
         this.hoveredAction = '';
@@ -266,6 +289,7 @@ export class RaceSystem extends createSystem({
         this.drawGarage();
         this.drawMenu();
         this.drawResults();
+        this.drawLobby();
       }),
     );
   }
@@ -273,7 +297,7 @@ export class RaceSystem extends createSystem({
   private setupBoard(boardEntity: Entity) {
     if (this.board) return;
     this.board = boardEntity;
-    const laps = boardEntity.getValue(RaceBoard, 'laps') ?? 8;
+    const laps = this.circuit.laps;
     this.sim = new RaceSim(this.track, Date.now() % 100000, laps);
 
     // ---- cars --------------------------------------------------------
@@ -353,31 +377,13 @@ export class RaceSystem extends createSystem({
     this.world.createTransformEntity(pick, boardEntity);
 
     // ---- start lights gantry over the grid ----------------------------
-    const start = this.track.points[0];
-    const tan = this.track.tangents[0];
-    const side = new Vector3().crossVectors(this.up, tan).normalize();
-    const gantry = new Group();
-    gantry.position.set(start.x + tan.x * 0.01, TRACK_SURFACE_Y + 0.05, start.z + tan.z * 0.01);
-    const beam = new Mesh(new BoxGeometry(0.006, 0.008, 0.075), new MeshStandardMaterial({ color: '#20262f' }));
-    beam.lookAt(this.tmpLook.copy(side).add(beam.position));
-    gantry.add(beam);
     this.lightOff = new MeshBasicMaterial({ color: '#3a0d10' });
     this.lightOn = new MeshBasicMaterial({ color: '#ff2433' });
-    const lg = new SphereGeometry(0.0035, 10, 8);
-    for (let i = 0; i < 5; i++) {
-      const l = new Mesh(lg, this.lightOff);
-      const o = (i - 2) * 0.013;
-      l.position.set(side.x * o, 0, side.z * o);
-      gantry.add(l);
-      this.lights.push(l);
-    }
-    for (const s of [-1, 1]) {
-      const post = new Mesh(new BoxGeometry(0.003, 0.05, 0.003), beam.material);
-      post.position.set(side.x * 0.038 * s, -0.025, side.z * 0.038 * s);
-      gantry.add(post);
-    }
+    const gantry = new Group();
+    gantry.name = 'start-gantry';
     this.world.createTransformEntity(gantry, boardEntity);
     this.gantry = gantry;
+    this.buildGantry();
 
     // ---- leaderboard (right of the board, angled to the viewer) -------
     this.leaderboard = new CanvasPanel(512, 860, 0.25, 'leaderboard');
@@ -404,6 +410,7 @@ export class RaceSystem extends createSystem({
     this.setupGarage(boardEntity, btnMat);
     this.setupResults(boardEntity, btnMat);
     this.setupMenu(btnMat);
+    this.setupLobby(btnMat);
 
     // ---- strategy panel: manage your driver (left of the controls) ------
     this.strategy = new CanvasPanel(640, 240, 0.27, 'strategy');
@@ -462,6 +469,8 @@ export class RaceSystem extends createSystem({
       this.drawControls();
     };
     if (q.has('autostart')) this.autostartPending = Math.max(1, Math.min(8, Number(q.get('speed')) || 1));
+    if (this.circuit !== CIRCUITS[0]) this.replaceBoard(this.circuit);
+    if (this.autostartPending || q.has('skiplobby')) this.mode = 'garage';
     this.setupIntro(boardEntity);
     this.startIntro();
     this.placeCars();
@@ -471,6 +480,38 @@ export class RaceSystem extends createSystem({
   }
 
   // ---------------------------------------------------------------------
+  /** (re)build the start-light gantry across the current circuit's start line */
+  private buildGantry() {
+    const gantry = this.gantry;
+    if (!gantry) return;
+    for (const c of gantry.children.slice()) {
+      gantry.remove(c);
+      if (c instanceof Mesh) c.geometry.dispose();
+    }
+    this.lights.length = 0;
+    const start = this.track.points[0];
+    const tan = this.track.tangents[0];
+    const side = new Vector3().crossVectors(this.up, tan).normalize();
+    gantry.position.set(start.x + tan.x * 0.01, TRACK_SURFACE_Y + 0.05, start.z + tan.z * 0.01);
+    const beamMat = new MeshStandardMaterial({ color: '#20262f' });
+    const beam = new Mesh(new BoxGeometry(0.006, 0.008, 0.075), beamMat);
+    beam.lookAt(side);
+    gantry.add(beam);
+    const lg = new SphereGeometry(0.0035, 10, 8);
+    for (let i = 0; i < 5; i++) {
+      const l = new Mesh(lg, this.lightOff);
+      const o = (i - 2) * 0.013;
+      l.position.set(side.x * o, 0, side.z * o);
+      gantry.add(l);
+      this.lights.push(l);
+    }
+    for (const sg of [-1, 1]) {
+      const post = new Mesh(new BoxGeometry(0.003, 0.05, 0.003), beamMat);
+      post.position.set(side.x * 0.038 * sg, -0.025, side.z * 0.038 * sg);
+      gantry.add(post);
+    }
+  }
+
   private onCarPinched(index: number) {
     if (!this.sim) return;
     this.audio.unlock();
@@ -494,7 +535,13 @@ export class RaceSystem extends createSystem({
       if (this.resultsT < 0) return;
       this.audio.click();
       if (action === 'results:again') this.restartRace();
+      else if (action === 'results:lobby') this.backToLobby();
       else this.backToGarage();
+      return;
+    }
+    if (action.startsWith('lobby:')) {
+      if (this.mode !== 'lobby') return;
+      this.onLobby(action);
       return;
     }
     // legacy pinch-to-gas driving: a pinch aimed at the panel is the throttle, not a button press
@@ -586,6 +633,7 @@ export class RaceSystem extends createSystem({
     if (prevPhase !== RacePhase.Finished && this.sim.phase === RacePhase.Finished) this.onRaceFinished();
     if (prevPhase !== this.sim.phase) this.drawControls();
     this.updateResults(delta);
+    this.updateLobby();
     if (import.meta.env.DEV) {
       this.dbgT += delta;
       if (this.dbgT > 5) {
@@ -759,6 +807,12 @@ export class RaceSystem extends createSystem({
   private updateGarage(delta: number) {
     const G = this.garage;
     if (!G) return;
+    if (this.mode === 'lobby') {
+      G.root.scale.setScalar(0.0001);
+      G.panel.mesh.scale.setScalar(0.0001);
+      this.controls.mesh.scale.setScalar(0.0001);
+      return;
+    }
     const show = this.mode !== 'race' && !this.introActive ? 1 : this.mode !== 'race' ? this.garageShown : 0;
     if (this.mode === 'garage') {
       G.spin.rotation.y += delta * 0.5;
@@ -890,6 +944,7 @@ export class RaceSystem extends createSystem({
     this.closeMenu();
     if (action === 'menu:restart') this.restartRace();
     else if (action === 'menu:garage') this.backToGarage();
+    else if (action === 'menu:lobby') this.backToLobby();
   }
 
   private resetRaceState() {
@@ -904,6 +959,7 @@ export class RaceSystem extends createSystem({
 
   /** same truck, straight back onto the grid */
   private restartRace() {
+    if (this.mode === 'lobby') return;
     this.resetRaceState();
     if (this.build.every((b) => b >= 0)) this.startDeliver();
     else this.enterGarage();
@@ -1028,6 +1084,255 @@ export class RaceSystem extends createSystem({
       ctx.fillText(b.label, M_W / 2, b.y + M_BTN.h / 2 + 3);
     }
     p.commit();
+  }
+
+  // ---------------------------------------------------------------------
+  // lobby: the paddock lounge where you pick a circuit before the garage
+
+  private setupLobby(btnMat: MeshBasicMaterial) {
+    const panel = new CanvasPanel(L_W, L_H, 0.8, 'lobby-panel');
+    panel.mesh.renderOrder = 20;
+    const pe = this.world.createTransformEntity(panel.mesh);
+    const addHit = (x: number, y: number, w: number, h: number, action: string) => {
+      const r = panel.rectToLocal(x, y, w, h);
+      const hit = new Mesh(new BoxGeometry(r.w, r.h, 0.01), btnMat);
+      hit.name = `btn-${action}`;
+      hit.position.set(r.cx, r.cy, 0.004);
+      const e = this.world.createTransformEntity(hit, pe);
+      e.addComponent(UiButton, { action });
+      e.addComponent(RayInteractable);
+    };
+    CIRCUITS.forEach((_, i) => {
+      const r = this.lobbyCard(i);
+      addHit(r.x, r.y, r.w, r.h, `lobby:pick:${i}`);
+    });
+    addHit(L_GO.x, L_GO.y, L_GO.w, L_GO.h, 'lobby:go');
+    this.lobby = panel;
+    this.drawLobby();
+  }
+
+  private lobbyCard(i: number) {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+    return {
+      x: L_CARD.x0 + col * (L_CARD.w + L_CARD.gx),
+      y: L_CARD.y0 + row * (L_CARD.h + L_CARD.gy),
+      w: L_CARD.w,
+      h: L_CARD.h,
+    };
+  }
+
+  private onLobby(action: string) {
+    this.audio.unlock();
+    if (action === 'lobby:go') {
+      this.audio.click();
+      this.leaveLobby();
+      return;
+    }
+    const i = Number(action.split(':')[2]);
+    if (!(i >= 0 && i < CIRCUITS.length) || i === this.lobbySel) return;
+    this.lobbySel = i;
+    this.audio.pop();
+    this.drawLobby();
+  }
+
+  /** chosen: build that circuit's diorama, then the opening reveals it and the garage opens */
+  private leaveLobby() {
+    const def = CIRCUITS[this.lobbySel];
+    if (def !== this.circuit) this.loadCircuit(def);
+    this.mode = 'garage';
+    this.lobby.mesh.scale.setScalar(0.0001);
+    if (this.board) this.board.object3D!.visible = true;
+    this.introPending = false;
+    this.startIntro();
+    this.enterGarage();
+    this.drawAll();
+  }
+
+  private backToLobby() {
+    this.resetRaceState();
+    this.enterGarage();
+    this.mode = 'lobby';
+    this.introActive = false;
+    this.drawLobby();
+    this.drawAll();
+  }
+
+  /** keep the lounge panel floating over the (hidden) table spot, and the board hidden meanwhile */
+  private updateLobby() {
+    const board = this.board?.object3D;
+    if (!board || !this.lobby) return;
+    const inLobby = this.mode === 'lobby';
+    board.visible = !inLobby;
+    if (!inLobby) {
+      this.lobby.mesh.scale.setScalar(0.0001);
+      return;
+    }
+    board.updateWorldMatrix(true, false);
+    const m = this.lobby.mesh;
+    m.position.set(0, 0.24, 0.06);
+    board.localToWorld(m.position);
+    board.getWorldQuaternion(this.tmpQ);
+    this.tilt.setFromAxisAngle(this.xAxis, -0.22);
+    m.quaternion.copy(this.tmpQ).multiply(this.tilt);
+    m.scale.setScalar(1);
+  }
+
+  /** swap the diorama + track + race for another circuit */
+  private loadCircuit(def: CircuitDef) {
+    this.circuit = def;
+    this.replaceBoard(def);
+    this.track = sampleTrack(createTrackCurve(def));
+    this.sim.setTrack(this.track, def.laps);
+    this.claimPlayer();
+    this.buildGantry();
+    this.drawIntroTitle();
+  }
+
+  private replaceBoard(def: CircuitDef) {
+    const obj = this.board?.object3D;
+    if (!obj) return;
+    const fresh = createRaceBoard(def);
+    for (const name of BOARD_PARTS) {
+      const old = obj.getObjectByName(name);
+      const next = fresh.getObjectByName(name);
+      if (!old || !next) continue;
+      const parent = old.parent!;
+      const at = parent.children.indexOf(old);
+      parent.remove(old);
+      if (old instanceof Mesh) {
+        old.geometry.dispose();
+        (old.material as MeshStandardMaterial).dispose();
+      }
+      next.removeFromParent();
+      parent.add(next);
+      // keep the original draw order among siblings
+      parent.children.splice(parent.children.indexOf(next), 1);
+      parent.children.splice(at, 0, next);
+    }
+    if (this.intro) this.lookupBoardParts(obj);
+  }
+
+  private drawLobby() {
+    const p = this.lobby;
+    if (!p) return;
+    const ctx = p.ctx;
+    p.background(0.92);
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffd23a';
+    ctx.font = '900 54px system-ui, sans-serif';
+    ctx.fillText('WORLD FOOD GRAND PRIX', 40, 62);
+    ctx.fillStyle = '#9fdcff';
+    ctx.font = '700 28px system-ui, sans-serif';
+    ctx.fillText('PADDOCK LOUNGE  ·  pick a circuit', 40, 112);
+    CIRCUITS.forEach((c, i) => {
+      const r = this.lobbyCard(i);
+      const sel = i === this.lobbySel;
+      const hover = this.hoveredAction === `lobby:pick:${i}`;
+      roundRect(ctx, r.x, r.y, r.w, r.h, 22);
+      ctx.fillStyle = sel ? 'rgba(255,210,58,0.28)' : hover ? 'rgba(56,245,255,0.22)' : 'rgba(255,255,255,0.07)';
+      ctx.fill();
+      ctx.lineWidth = sel ? 6 : hover ? 4 : 2;
+      ctx.strokeStyle = sel ? '#ffd23a' : hover ? '#38f5ff' : 'rgba(255,255,255,0.28)';
+      ctx.stroke();
+      // flag stripe
+      ctx.fillStyle = c.flag[0];
+      ctx.fillRect(r.x + 18, r.y + 18, 14, 34);
+      ctx.fillStyle = c.flag[1];
+      ctx.fillRect(r.x + 32, r.y + 18, 14, 34);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = '800 26px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText(this.fitText(c.name, 230, 26, 800), r.x + 58, r.y + 36);
+      this.drawOutline(c, r.x + 20, r.y + 66, r.w - 40, r.h - 84, c.palette.glow, sel ? 5 : 3);
+    });
+    // selected circuit, large
+    const c = CIRCUITS[this.lobbySel];
+    const px = 700;
+    roundRect(ctx, px, 150, 660, 510, 26);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fill();
+    this.drawOutline(c, px + 40, 176, 580, 250, c.palette.glow, 8);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `900 ${c.name.length > 16 ? 44 : 52}px system-ui, sans-serif`;
+    ctx.fillText(c.name.toUpperCase(), px + 32, 476);
+    ctx.fillStyle = c.palette.glow;
+    ctx.font = '800 28px system-ui, sans-serif';
+    ctx.fillText(`${c.country.toUpperCase()}  ·  ${c.laps} LAPS`, px + 32, 528);
+    ctx.fillStyle = '#cfe9ff';
+    ctx.font = '600 26px system-ui, sans-serif';
+    ctx.fillText(c.style, px + 32, 572);
+    ctx.fillStyle = '#9fb4cc';
+    ctx.font = 'italic 500 24px system-ui, sans-serif';
+    ctx.fillText(this.fitText(c.tagline, 600, 24, 500, 'italic '), px + 32, 616);
+    const hover = this.hoveredAction === 'lobby:go';
+    roundRect(ctx, L_GO.x, L_GO.y, L_GO.w, L_GO.h, 30);
+    ctx.fillStyle = hover ? 'rgba(61,255,139,0.8)' : 'rgba(46,217,168,0.5)';
+    ctx.fill();
+    ctx.lineWidth = hover ? 6 : 3;
+    ctx.strokeStyle = '#3dff8b';
+    ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '900 44px system-ui, sans-serif';
+    ctx.fillText('TO THE GARAGE', L_GO.x + L_GO.w / 2, L_GO.y + L_GO.h / 2 + 2);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#9fb4cc';
+    ctx.font = '600 24px system-ui, sans-serif';
+    ctx.fillText('Fictional circuits of the World Food Grand Prix', 700, 735);
+    p.commit();
+  }
+
+  /** shrink a font until the text fits; returns the text (font left on ctx) */
+  private fitText(text: string, maxW: number, size: number, weight: number, style = '') {
+    const ctx = this.lobby.ctx;
+    let s = size;
+    ctx.font = `${style}${weight} ${s}px system-ui, sans-serif`;
+    while (ctx.measureText(text).width > maxW && s > 14) {
+      s -= 2;
+      ctx.font = `${style}${weight} ${s}px system-ui, sans-serif`;
+    }
+    return text;
+  }
+
+  /** a circuit's centreline, fitted into a box on the lobby canvas */
+  private drawOutline(c: CircuitDef, x: number, y: number, w: number, h: number, color: string, width: number) {
+    const ctx = this.lobby.ctx;
+    const curve = createTrackCurve(c);
+    const pts = curve.getSpacedPoints(120);
+    let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+    for (const p of pts) {
+      x0 = Math.min(x0, p.x);
+      x1 = Math.max(x1, p.x);
+      z0 = Math.min(z0, p.z);
+      z1 = Math.max(z1, p.z);
+    }
+    const s = Math.min(w / (x1 - x0), h / (z1 - z0));
+    const ox = x + (w - (x1 - x0) * s) / 2;
+    const oy = y + (h - (z1 - z0) * s) / 2;
+    ctx.beginPath();
+    pts.forEach((p, i) => {
+      const px = ox + (p.x - x0) * s;
+      const py = oy + (p.z - z0) * s;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    });
+    ctx.closePath();
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = 'rgba(0,0,0,0.6)';
+    ctx.lineWidth = width + 4;
+    ctx.stroke();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    ctx.stroke();
+    // start line
+    const p0 = pts[0];
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(ox + (p0.x - x0) * s, oy + (p0.z - z0) * s, width + 2, 0, Math.PI * 2);
+    ctx.fill();
   }
 
   private drawGarage() {
@@ -1186,7 +1491,6 @@ export class RaceSystem extends createSystem({
 
   private setupIntro(boardEntity: Entity) {
     const obj = boardEntity.object3D!;
-    const glow = obj.getObjectByName('board-glow') as Mesh | undefined;
     const ringGeo = new RingGeometry(0.48, 0.5, 64);
     ringGeo.rotateX(-Math.PI / 2);
     const ring = new Mesh(
@@ -1202,6 +1506,34 @@ export class RaceSystem extends createSystem({
     (title.mesh.material as MeshBasicMaterial).opacity = 0;
     title.mesh.visible = false;
     this.world.createTransformEntity(title.mesh, boardEntity);
+    this.intro = {
+      water: undefined,
+      land: [],
+      trees: undefined,
+      dome: undefined,
+      glow: undefined,
+      glowCount: 0,
+      ring,
+      title,
+    };
+    this.lookupBoardParts(obj);
+    this.drawIntroTitle();
+  }
+
+  /** find this circuit's diorama meshes that the opening animates */
+  private lookupBoardParts(obj: Object3D) {
+    const I = this.intro;
+    const glow = obj.getObjectByName('board-glow') as Mesh | undefined;
+    I.water = obj.getObjectByName('water');
+    I.land = ['board-solid', 'island-fill'].map((n) => obj.getObjectByName(n)).filter((o): o is Object3D => !!o);
+    I.trees = obj.getObjectByName('trees');
+    I.dome = obj.getObjectByName('dome') as Mesh | undefined;
+    I.glow = glow;
+    I.glowCount = glow ? glow.geometry.getAttribute('position').count : 0;
+  }
+
+  private drawIntroTitle() {
+    const title = this.intro.title;
     {
       const ctx = title.ctx;
       ctx.clearRect(0, 0, 1024, 300);
@@ -1216,29 +1548,30 @@ export class RaceSystem extends createSystem({
       ctx.textBaseline = 'middle';
       ctx.fillStyle = '#38f5ff';
       ctx.font = '700 34px system-ui, sans-serif';
-      ctx.fillText('THE GREASY GRAND PRIX  ·  ROUND 1', 512, 88);
+      const c = this.circuit;
+      ctx.fillText(`WORLD FOOD GRAND PRIX  ·  ROUND ${CIRCUITS.indexOf(c) + 1}  ·  ${c.country.toUpperCase()}`, 512, 88);
       ctx.fillStyle = '#ffffff';
-      ctx.font = '900 96px system-ui, sans-serif';
-      ctx.fillText('FOOD TRUCK RALLY', 512, 160);
+      let size = 96;
+      ctx.font = `900 ${size}px system-ui, sans-serif`;
+      while (ctx.measureText(c.name.toUpperCase()).width > 940 && size > 40) {
+        size -= 4;
+        ctx.font = `900 ${size}px system-ui, sans-serif`;
+      }
+      ctx.fillText(c.name.toUpperCase(), 512, 160);
       ctx.fillStyle = '#ffe14d';
-      ctx.font = '600 32px system-ui, sans-serif';
-      ctx.fillText('Build it. Race it. Don\'t spill the salsa.', 512, 228);
+      ctx.font = '600 28px system-ui, sans-serif';
+      ctx.fillText(c.tagline, 512, 228);
       title.commit();
     }
-    this.intro = {
-      water: obj.getObjectByName('water'),
-      land: ['board-solid', 'island-fill'].map((n) => obj.getObjectByName(n)).filter((o): o is Object3D => !!o),
-      trees: obj.getObjectByName('trees'),
-      dome: obj.getObjectByName('dome') as Mesh | undefined,
-      glow,
-      glowCount: glow ? glow.geometry.getAttribute('position').count : 0,
-      ring,
-      title,
-    };
   }
 
   private startIntro() {
     if (!this.intro) return;
+    if (this.mode === 'lobby') {
+      // the opening plays once a circuit is chosen
+      this.introPending = true;
+      return;
+    }
     this.introActive = true;
     this.introT = -0.4;
     this.introLanded = 0;
@@ -1663,7 +1996,7 @@ export class RaceSystem extends createSystem({
     ctx.textAlign = 'left';
     ctx.fillStyle = '#38f5ff';
     ctx.font = '800 30px system-ui, sans-serif';
-    ctx.fillText('GREASY GRAND PRIX', 28, 46);
+    ctx.fillText(this.circuit.name.toUpperCase(), 28, 46);
     ctx.fillStyle = '#ffffff';
     ctx.font = '700 40px system-ui, sans-serif';
     const lapText =

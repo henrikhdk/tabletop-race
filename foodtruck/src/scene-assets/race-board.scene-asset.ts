@@ -12,10 +12,12 @@ import {
   Vector3,
 } from '@iwsdk/core';
 import { hexToRgb, MeshBuilder } from '../race/mesh-builder.js';
-import { sampleTrack, TRACK_HALF_WIDTH, TRACK_SAMPLES, TRACK_SURFACE_Y } from '../race/track.js';
+import { CircuitDef, CircuitPalette, CIRCUITS } from '../race/circuits.js';
+import { createTrackCurve, sampleTrack, TRACK_HALF_WIDTH, TRACK_SAMPLES, TRACK_SURFACE_Y } from '../race/track.js';
 
 /**
- * Tabletop diorama of the fictional "Ile Lumiere" island circuit.
+ * Tabletop diorama of one World Food Grand Prix circuit (see circuits.ts);
+ * the registered asset is the first circuit, others are built at runtime.
  * The core play area is ~1.1 m x 0.66 m; the water (with cruising boats added
  * at runtime) spreads well past it and fades out, so the scene grows beyond
  * the real table. Origin = table contact point at the centre.
@@ -44,7 +46,7 @@ function pointInPoly(x: number, z: number, pts: Vector3[]): boolean {
   return inside;
 }
 
-function createWater(): Mesh {
+function createWater(pal: CircuitPalette): Mesh {
   // big fading water sheet: alpha falls off towards a rounded-rect edge
   const W = 2.4;
   const D = 1.7;
@@ -52,8 +54,8 @@ function createWater(): Mesh {
   geo.rotateX(-Math.PI / 2);
   const pos = geo.getAttribute('position');
   const colors = new Float32Array(pos.count * 4);
-  const deep = hexToRgb('#0b2f52');
-  const shallow = hexToRgb('#1a5f8c');
+  const deep = hexToRgb(pal.waterDeep);
+  const shallow = hexToRgb(pal.waterShallow);
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i);
     const z = pos.getZ(i);
@@ -85,10 +87,11 @@ function createWater(): Mesh {
   return water;
 }
 
-export function createRaceBoard(): Group {
+export function createRaceBoard(circuit: CircuitDef = CIRCUITS[0]): Group {
   const root = new Group();
   root.name = 'race-board';
-  const track = sampleTrack();
+  const pal = circuit.palette;
+  const track = sampleTrack(createTrackCurve(circuit));
   const up = new Vector3(0, 1, 0);
   const pts = track.points.slice(0, TRACK_SAMPLES);
   const normalAt = (i: number) => new Vector3().crossVectors(up, track.tangents[i]).normalize();
@@ -103,12 +106,12 @@ export function createRaceBoard(): Group {
     return pointInPoly(p.x, p.z, pts) ? -1 : 1;
   })();
 
-  root.add(createWater());
+  root.add(createWater(pal));
 
   const solid = new MeshBuilder();
-  const rnd = seeded(7);
-  const land = hexToRgb('#3c4a3e');
-  const landEdge = hexToRgb('#2a332c');
+  const rnd = seeded(circuit.seed);
+  const land = hexToRgb(pal.land);
+  const landEdge = hexToRgb(pal.landEdge);
 
   // --- main island: fill inside the loop + a margin band + a shore skirt ---
   const shape = new Shape();
@@ -116,7 +119,7 @@ export function createRaceBoard(): Group {
   const fill = new ShapeGeometry(shape, 1);
   fill.rotateX(-Math.PI / 2);
   fill.translate(0, ISLAND_Y, 0);
-  const fillMesh = new Mesh(fill, new MeshStandardMaterial({ color: '#3c4a3e', roughness: 0.95, side: DoubleSide }));
+  const fillMesh = new Mesh(fill, new MeshStandardMaterial({ color: pal.land, roughness: 0.95, side: DoubleSide }));
   fillMesh.name = 'island-fill';
   root.add(fillMesh);
 
@@ -140,7 +143,7 @@ export function createRaceBoard(): Group {
   }
 
   // --- asphalt, kerbs, chequer ---
-  solid.color = hexToRgb('#2f333b');
+  solid.color = hexToRgb(pal.asphalt);
   for (let i = 0; i < TRACK_SAMPLES; i++) {
     solid.quad(
       side(i, -TRACK_HALF_WIDTH),
@@ -151,7 +154,7 @@ export function createRaceBoard(): Group {
   }
   for (let i = 0; i < TRACK_SAMPLES; i++) {
     if (track.curvature[i] < 9) continue;
-    solid.color = Math.floor(i / 3) % 2 === 0 ? hexToRgb('#e8333b') : hexToRgb('#f2f2f2');
+    solid.color = Math.floor(i / 3) % 2 === 0 ? hexToRgb(pal.kerbA) : hexToRgb(pal.kerbB);
     const y = TRACK_SURFACE_Y + 0.0006;
     for (const sgn of [1, -1]) {
       const a0 = side(i, sgn * TRACK_HALF_WIDTH, y);
@@ -180,18 +183,29 @@ export function createRaceBoard(): Group {
     }
     return false;
   };
+  // pit building: inside the loop, alongside the run up to the start line
+  const pitI = TRACK_SAMPLES - 22;
+  const pitT = track.tangents[pitI];
+  const pitRot = Math.atan2(-pitT.z, pitT.x);
+  const pitPos = side(pitI, -outward * 0.045, ISLAND_Y);
   solid.color = hexToRgb('#8794a6');
-  solid.box(-0.35, ISLAND_Y, -0.055, 0.12, 0.016, 0.022); // pit building
-  solid.color = hexToRgb('#38f5ff');
-  solid.box(-0.35, ISLAND_Y + 0.016, -0.055, 0.12, 0.002, 0.022);
-  const stands: Array<[number, number, number, number]> = [
-    [0.08, -0.16, 0.2, 0.0],
-    [-0.05, -0.165, 0.12, 0.08],
+  solid.box(pitPos.x, ISLAND_Y, pitPos.z, 0.12, 0.016, 0.022, pitRot); // pit building
+  solid.color = hexToRgb(pal.glow);
+  solid.box(pitPos.x, ISLAND_Y + 0.016, pitPos.z, 0.12, 0.002, 0.022, pitRot);
+  // grandstands around the outside, wherever the layout leaves room
+  const standSpots: Array<[number, number, number, number]> = [
+    [0.08, -0.205, 0.2, 0.0],
+    [-0.22, -0.205, 0.14, 0.0],
     [0.555, 0.02, 0.1, Math.PI / 2],
-    [-0.54, 0.0, 0.1, Math.PI / 2],
-    [-0.3, 0.16, 0.12, 0],
-    [0.1, 0.16, 0.14, 0],
+    [-0.545, 0.0, 0.1, Math.PI / 2],
+    [-0.3, 0.228, 0.12, 0],
+    [0.1, 0.228, 0.14, 0],
   ];
+  const stands = standSpots.filter(([x, z, len, rot]) => {
+    const dx = Math.cos(rot) * len * 0.5;
+    const dz = -Math.sin(rot) * len * 0.5;
+    return !nearTrack(x, z, 0.04) && !nearTrack(x + dx, z + dz, 0.035) && !nearTrack(x - dx, z - dz, 0.035);
+  });
   for (const [x, z, len, rot] of stands) {
     for (let k = 0; k < 3; k++) {
       solid.color = k === 2 ? hexToRgb('#d8dee8') : hexToRgb('#5a6677');
@@ -205,14 +219,14 @@ export function createRaceBoard(): Group {
 
   // --- trees inside the island ---
   const trees = new MeshBuilder();
-  for (let n = 0; n < 260; n++) {
+  for (let n = 0; n < 300; n++) {
     const x = -0.52 + rnd() * 1.06;
-    const z = -0.15 + rnd() * 0.3;
+    const z = -0.17 + rnd() * 0.37;
     if (!pointInPoly(x, z, pts) || nearTrack(x, z, 0.034)) continue;
-    if (x > -0.42 && x < -0.28 && z > -0.075 && z < -0.035) continue; // pits
+    if (Math.hypot(x - pitPos.x, z - pitPos.z) < 0.07) continue; // pits
     const h = 0.012 + rnd() * 0.012;
     const g = 0.6 + rnd() * 0.4;
-    trees.color = [0.05 * g, 0.22 * g, 0.09 * g];
+    trees.color = [pal.tree[0] * g, pal.tree[1] * g, pal.tree[2] * g];
     const r = 0.004 + rnd() * 0.003;
     // simple 4-sided cone
     const top = new Vector3(x, ISLAND_Y + h, z);
@@ -237,11 +251,13 @@ export function createRaceBoard(): Group {
     solid.color = [g * 0.8, g * 0.9, g * 1.3];
     solid.box(x, ISLAND_Y, z, 0.014 + rnd() * 0.016, h, 0.014 + rnd() * 0.016, rnd() * 0.5);
   }
-  // bridge to the main island
-  solid.color = hexToRgb('#9aa6b6');
-  solid.box(-0.2, ISLAND_Y, -0.2, 0.014, 0.003, 0.11);
-  solid.box(-0.207, ISLAND_Y, -0.2, 0.002, 0.008, 0.11);
-  solid.box(-0.193, ISLAND_Y, -0.2, 0.002, 0.008, 0.11);
+  // bridge to the main island (only where it doesn't land on the track)
+  if (!nearTrack(-0.2, -0.165, 0.045)) {
+    solid.color = hexToRgb('#9aa6b6');
+    solid.box(-0.2, ISLAND_Y, -0.2, 0.014, 0.003, 0.11);
+    solid.box(-0.207, ISLAND_Y, -0.2, 0.002, 0.008, 0.11);
+    solid.box(-0.193, ISLAND_Y, -0.2, 0.002, 0.008, 0.11);
+  }
 
   // moored yachts in a marina east of the hairpin
   solid.color = [0.85, 0.87, 0.9];
@@ -258,7 +274,7 @@ export function createRaceBoard(): Group {
 
   // geodesic-style dome (wireframe glow) on the north island
   const dome = new MeshBuilder();
-  dome.color = hexToRgb('#7fe9ff');
+  dome.color = hexToRgb(pal.glow);
   const R = 0.04;
   const rings = 5;
   const segs = 14;
@@ -285,7 +301,7 @@ export function createRaceBoard(): Group {
 
   // --- glowing track edges ---
   const glow = new MeshBuilder();
-  glow.color = hexToRgb('#38f5ff');
+  glow.color = hexToRgb(pal.glow);
   for (let i = 0; i < TRACK_SAMPLES; i++) {
     const y = TRACK_SURFACE_Y + 0.0012;
     for (const sgn of [1, -1]) {

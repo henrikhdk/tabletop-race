@@ -126,7 +126,7 @@ export class RaceSim {
   private readonly cornerK = 0.045;
 
   constructor(
-    private readonly track: TrackSample,
+    private track: TrackSample,
     seed = 1,
     laps = 8,
   ) {
@@ -156,6 +156,13 @@ export class RaceSim {
     }));
     this.order = this.cars.slice();
     this.reset(seed);
+  }
+
+  /** switch circuits (and race distance); puts everyone back on the grid */
+  setTrack(track: TrackSample, laps: number) {
+    this.track = track;
+    this.totalLaps = laps;
+    this.reset();
   }
 
   reset(seed = Math.floor(Math.random() * 1e9)) {
