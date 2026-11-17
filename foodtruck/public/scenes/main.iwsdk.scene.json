@@ -47,7 +47,7 @@
       },
       "components": {
         "RaceBoard": {
-          "laps": 8
+          "laps": 3
         }
       }
     },

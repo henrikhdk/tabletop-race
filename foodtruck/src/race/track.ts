@@ -1,42 +1,15 @@
 import { CatmullRomCurve3, Vector3 } from '@iwsdk/core';
+import { CircuitDef, CIRCUITS } from './circuits.js';
 
 /**
- * "Ile Lumiere" — a fictional island street circuit whose flow is inspired by
- * classic island-park circuits: a short pit straight into a left/right S,
- * flowing esses along the south shore, a tight hairpin at the far end, a long
- * back straight and a quick final chicane before the line.
+ * Track centreline sampling for a circuit from ./circuits.ts.
  * Board-local coordinates in meters: X right, Z towards the viewer, Y up.
  */
-const CONTROL_POINTS: ReadonlyArray<readonly [number, number]> = [
-  [-0.3, -0.1], // start / finish
-  [-0.4, -0.095],
-  [-0.47, -0.055], // T1 left
-  [-0.445, 0.0], // T2 right
-  [-0.48, 0.055],
-  [-0.42, 0.105], // T3/T4
-  [-0.3, 0.115],
-  [-0.18, 0.085], // kink
-  [-0.06, 0.12], // T6/T7
-  [0.05, 0.085],
-  [0.16, 0.115], // T8/T9
-  [0.23, 0.075],
-  [0.34, 0.095],
-  [0.44, 0.075],
-  [0.495, 0.02], // hairpin
-  [0.465, -0.035],
-  [0.38, -0.055],
-  [0.15, -0.09], // back straight
-  [-0.1, -0.125],
-  [-0.165, -0.125], // final chicane
-  [-0.195, -0.095],
-  [-0.235, -0.115],
-];
-
 export const TRACK_HALF_WIDTH = 0.022;
 export const TRACK_SURFACE_Y = 0.032;
 
-export function createTrackCurve(): CatmullRomCurve3 {
-  const pts = CONTROL_POINTS.map(([x, z]) => new Vector3(x, TRACK_SURFACE_Y, z));
+export function createTrackCurve(circuit: CircuitDef = CIRCUITS[0]): CatmullRomCurve3 {
+  const pts = circuit.points.map(([x, z]) => new Vector3(x, TRACK_SURFACE_Y, z));
   return new CatmullRomCurve3(pts, true, 'centripetal', 0.5);
 }
 
@@ -53,7 +26,7 @@ export interface TrackSample {
 
 export const TRACK_SAMPLES = 600;
 
-export function sampleTrack(curve = createTrackCurve()): TrackSample {
+export function sampleTrack(curve: CatmullRomCurve3 = createTrackCurve()): TrackSample {
   const points = curve.getSpacedPoints(TRACK_SAMPLES);
   const tangents: Vector3[] = [];
   const distance = new Float32Array(points.length);

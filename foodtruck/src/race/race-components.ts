@@ -15,3 +15,8 @@ export const UiButton = createComponent('UiButton', {
 export const RaceBoard = createComponent('RaceBoard', {
   laps: { type: Types.Int16, default: 8, min: 1, max: 30 },
 });
+
+/** A grabbable kitchen item on the cooking bench; `kind` = base | pepper | cheese | filling. */
+export const KitchenItem = createComponent('KitchenItem', {
+  kind: { type: Types.String, default: '' },
+});
