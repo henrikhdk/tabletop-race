@@ -40,6 +40,7 @@ import { RaceAudio } from './race-audio.js';
 import { HandPlay } from './hand-play.js';
 import { PalmUpDetector } from './palm-menu.js';
 import { dishLabel, Kitchen } from './kitchen.js';
+import { VrShell } from './vr-shell.js';
 import { Build, buildStats, SLOT_NAMES, SLOTS, TruckModel } from './food-truck.js';
 
 const PLAYER = 6; // grid slot P7: you start mid-pack
@@ -198,6 +199,12 @@ export class RaceSystem extends createSystem({
   private palmUp!: PalmUpDetector;
   // --- cooking bench ---
   private kitchen?: Kitchen;
+  /** VR surround the experience opens in; dissolves to passthrough when racing */
+  private shell = new VrShell();
+  private shellFocus = new Vector3();
+  private shellHead = new Vector3();
+  /** ?ar: skip the VR opening and stay in passthrough */
+  private arOnly = false;
   /** seconds on the grid waiting for the tutorial dish (-1 = not waiting) */
   private gridT = -1;
   private gridServedT = -1;
@@ -634,6 +641,7 @@ export class RaceSystem extends createSystem({
         this.startIntro();
       }
     }
+    this.updateShell(delta, vis !== VisibilityState.NonImmersive);
     if (this.world.visibilityState.peek() === VisibilityState.VisibleBlurred) return;
     const dt = Math.min(delta, 0.05);
     const prevPhase = this.sim.phase;
@@ -903,6 +911,9 @@ export class RaceSystem extends createSystem({
   /** pause menu: opened by turning a palm up, floats in front of the player */
   private setupMenu(btnMat: MeshBasicMaterial) {
     this.palmUp = new PalmUpDetector(this.world);
+    this.world.createTransformEntity(this.shell.mesh);
+    this.arOnly = new URLSearchParams(location.search).has('ar');
+    if (this.arOnly) this.shell.skip();
     const panel = new CanvasPanel(M_W, M_H, 0.3, 'pause-menu');
     panel.mesh.renderOrder = 30;
     panel.mesh.scale.setScalar(0.0001);
@@ -1173,6 +1184,16 @@ export class RaceSystem extends createSystem({
     this.introActive = false;
     this.drawLobby();
     this.drawAll();
+  }
+
+  /** VR while in the lounge (and until the board lands on the table), passthrough once the opening plays */
+  private updateShell(delta: number, immersive: boolean) {
+    const wantVr = this.mode === 'lobby' || !this.autoPlaced;
+    if (wantVr && this.shell.revealing && !this.arOnly) this.shell.cover(immersive ? 1.4 : 0.01);
+    else if (!wantVr && !this.shell.revealing) this.shell.reveal();
+    this.player.head.getWorldPosition(this.shellHead);
+    this.board!.object3D!.getWorldPosition(this.shellFocus);
+    this.shell.update(Math.min(delta, 0.05), immersive, this.shellHead, this.shellFocus);
   }
 
   /** keep the lounge panel floating over the (hidden) table spot, and the board hidden meanwhile */
@@ -1933,6 +1954,8 @@ export class RaceSystem extends createSystem({
     const prevBg = this.world.scene.background;
     r.xr.enabled = false;
     this.pip.mesh.visible = false;
+    const shellVis = this.shell.mesh.visible;
+    this.shell.mesh.visible = false;
     this.world.scene.background = this.pipBg;
     r.setRenderTarget(this.pipTarget);
     r.clear();
@@ -1940,6 +1963,7 @@ export class RaceSystem extends createSystem({
     r.setRenderTarget(prevTarget);
     this.world.scene.background = prevBg;
     this.pip.mesh.visible = true;
+    this.shell.mesh.visible = shellVis;
     r.xr.enabled = xrEnabled;
   }
 
